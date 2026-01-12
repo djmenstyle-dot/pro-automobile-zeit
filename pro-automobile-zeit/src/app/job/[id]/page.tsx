@@ -43,6 +43,13 @@ function fmtMin(min: number) {
   return `${h}h ${m}min`;
 }
 
+function fmtHM(min: number) {
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  if (h <= 0) return `${m} min`;
+  return `${h} h ${m} min`;
+}
+
 export default function JobPage({ params }: { params: { id: string } }) {
   const jobId = params.id;
 
@@ -143,56 +150,92 @@ export default function JobPage({ params }: { params: { id: string } }) {
     await load();
   }
 
-  function exportCsv() {
+  async function exportXlsx() {
     if (!job) return;
 
-    const header = [
-      "job_title",
-      "customer",
-      "vehicle",
-      "plate",
-      "job_status",
-      "worker",
-      "task",
-      "start",
-      "end",
-      "duration_min",
-    ].join(",");
+    const XLSX = await import("xlsx");
+    const now = new Date();
+    const datum = now.toLocaleString("de-CH");
 
     const rows = entries
       .slice()
       .reverse()
       .map((e) => {
-        const dur = durationMinutes(e.start_ts, e.end_ts);
-        const cols = [
-          job.title,
-          job.customer || "",
-          job.vehicle || "",
-          job.plate || "",
-          job.status || "open",
-          e.worker,
-          e.task || "",
-          e.start_ts,
-          e.end_ts || "",
-          String(dur),
-        ].map((x) => JSON.stringify(x));
-        return cols.join(",");
+        const min = durationMinutes(e.start_ts, e.end_ts);
+        return {
+          Mitarbeiter: e.worker,
+          Tätigkeit: e.task || "",
+          Start: new Date(e.start_ts).toLocaleString("de-CH"),
+          Ende: e.end_ts ? new Date(e.end_ts).toLocaleString("de-CH") : "läuft…",
+          Minuten: min,
+          Dauer: fmtHM(min),
+        };
       });
 
-    const csv = [header, ...rows].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
+    const totalMin = entries.reduce((acc, e) => acc + durationMinutes(e.start_ts, e.end_ts), 0);
+    const perWorker: Record<string, number> = {};
+    for (const e of entries) {
+      const m = durationMinutes(e.start_ts, e.end_ts);
+      perWorker[e.worker] = (perWorker[e.worker] || 0) + m;
+    }
 
+    const aoa: any[][] = [];
+    aoa.push([`Pro Automobile – Rapport`, "", "", "", "", ""]);
+    aoa.push([`Erstellt: ${datum}`, "", "", "", "", ""]);
+    aoa.push(["", "", "", "", "", ""]);
+    aoa.push(["Auftrag", job.title, "", "", "", ""]);
+    aoa.push(["Kunde", job.customer || "", "", "", "", ""]);
+    aoa.push(["Fahrzeug", job.vehicle || "", "", "", "", ""]);
+    aoa.push(["Kontrollschild", job.plate || "", "", "", "", ""]);
+    aoa.push(["Status", job.status || "open", "", "", "", ""]);
+    aoa.push(["", "", "", "", "", ""]);
+
+    aoa.push(["Mitarbeiter", "Tätigkeit", "Start", "Ende", "Minuten", "Dauer"]);
+    for (const r of rows) aoa.push([r.Mitarbeiter, r.Tätigkeit, r.Start, r.Ende, r.Minuten, r.Dauer]);
+
+    aoa.push(["", "", "", "", "", ""]);
+    aoa.push(["TOTAL", "", "", "", totalMin, fmtHM(totalMin)]);
+    Object.entries(perWorker).forEach(([w, m]) => aoa.push([`TOTAL ${w}`, "", "", "", m, fmtHM(m)]));
+
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+
+    (ws as any)["!cols"] = [
+      { wch: 14 },
+      { wch: 18 },
+      { wch: 20 },
+      { wch: 20 },
+      { wch: 10 },
+      { wch: 12 },
+    ];
+
+    (ws as any)["!merges"] = [
+      { s: { r: 0, c: 0 }, e: { r: 0, c: 5 } },
+      { s: { r: 1, c: 0 }, e: { r: 1, c: 5 } },
+    ];
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Rapport");
+
+    const fileName = `rapport_${(job.plate || "ohne-kennzeichen").replace(/\s+/g, "_")}_${jobId}.xlsx`;
+
+    const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+    const blob = new Blob([wbout], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+
+    const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `rapport_${(job.plate || "ohne-kennzeichen").replace(/\s+/g, "_")}_${jobId}.csv`;
+    a.download = fileName;
     a.click();
     URL.revokeObjectURL(url);
   }
 
   return (
     <div>
-      <a href="/" style={{ textDecoration: "none" }}>← zurück</a>
+      <a href="/" style={{ textDecoration: "none" }}>
+        ← zurück
+      </a>
 
       <div className="card">
         <div className="row">
@@ -212,7 +255,9 @@ export default function JobPage({ params }: { params: { id: string } }) {
         <div className="row">
           <div>
             <div className="h2">QR-Link (Auftrag scannen)</div>
-            <div className="muted" style={{ fontSize: 13, wordBreak: "break-all" }}>{jobLink}</div>
+            <div className="muted" style={{ fontSize: 13, wordBreak: "break-all" }}>
+              {jobLink}
+            </div>
           </div>
           <img src={qrUrl} alt="QR" style={{ width: 140, height: 140, borderRadius: 16 }} />
         </div>
@@ -221,27 +266,46 @@ export default function JobPage({ params }: { params: { id: string } }) {
       <div className="card">
         <div className="row">
           <div className="h2">Start / Stop</div>
-          <div className="muted" style={{ fontSize: 12 }}>{msg}</div>
+          <div className="muted" style={{ fontSize: 12 }}>
+            {msg}
+          </div>
         </div>
 
         <div className="grid2" style={{ marginTop: 10 }}>
           <select className="select" value={worker} onChange={(e) => setWorker(e.target.value)}>
-            {WORKERS.map((w) => <option key={w} value={w}>{w}</option>)}
+            {WORKERS.map((w) => (
+              <option key={w} value={w}>
+                {w}
+              </option>
+            ))}
           </select>
 
           <select className="select" value={task} onChange={(e) => setTask(e.target.value)}>
-            {TASKS.map((t) => <option key={t} value={t}>{t}</option>)}
+            {TASKS.map((t) => (
+              <option key={t} value={t}>
+                {t}
+              </option>
+            ))}
           </select>
         </div>
 
         <div className="grid2" style={{ marginTop: 10 }}>
-          <button className="btn btnPrimary" onClick={start} disabled={!!runningId || done}>Start</button>
-          <button className="btn btnDark" onClick={stop} disabled={!runningId}>Stop</button>
+          <button className="btn btnPrimary" onClick={start} disabled={!!runningId || done}>
+            Start
+          </button>
+          <button className="btn btnDark" onClick={stop} disabled={!runningId}>
+            Stop
+          </button>
         </div>
 
+        {/* ✅ EXPORT BLOCK: Abschluss + Excel */}
         <div className="grid2" style={{ marginTop: 10 }}>
-          <button className="btn btnDanger" onClick={closeJob} disabled={done}>Auftrag abschliessen ✅</button>
-          <button className="btn" onClick={exportCsv}>CSV Rapport (mit Kontrollschild)</button>
+          <button className="btn btnDanger" onClick={closeJob} disabled={done}>
+            Auftrag abschliessen ✅
+          </button>
+          <button className="btn" onClick={exportXlsx}>
+            Rapport (Excel .xlsx)
+          </button>
         </div>
       </div>
 
@@ -252,7 +316,9 @@ export default function JobPage({ params }: { params: { id: string } }) {
         </div>
 
         {Object.entries(totals.perWorker).map(([w, m]) => (
-          <div key={w}>{w}: {fmtMin(m)}</div>
+          <div key={w}>
+            {w}: {fmtMin(m)}
+          </div>
         ))}
 
         <div style={{ marginTop: 12, overflowX: "auto" }}>
