@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "../../../lib/supabaseClient";
+import { ensureAdmin } from "../../lib/admin";
 
 type Job = {
   id: string;
@@ -9,9 +10,15 @@ type Job = {
   customer: string | null;
   vehicle: string | null;
   plate: string | null;
-  status: string | null; // "open" | "done"
+  status: string | null; // open | done
   created_at?: string | null;
   closed_at?: string | null;
+
+  vin?: string | null;
+  checklist?: any; // jsonb
+  signature_url?: string | null;
+  signature_name?: string | null;
+  signature_at?: string | null;
 };
 
 type Entry = {
@@ -25,7 +32,7 @@ type Entry = {
 
 type PhotoItem = {
   name: string;
-  path: string; // jobId/name
+  path: string;
   signedUrl?: string;
 };
 
@@ -33,10 +40,17 @@ const WORKERS = ["Esteban", "Eron", "Jeremie", "Tsvetan", "Mensel"];
 const TASKS = ["Service", "Diagnose", "Bremsen", "Reifen", "MFK", "Elektrik", "Klima", "Probefahrt"];
 
 const BUCKET = "job-photos";
-
-// ⚠️ Hinweis: NEXT_PUBLIC_* ist im Frontend sichtbar. Für „richtig sicher“ müsste das über eine Server-Route laufen.
-// Für eure super-einfache PIN-Variante ok:
 const ADMIN_PIN = process.env.NEXT_PUBLIC_ADMIN_PIN || "";
+
+const CHECKLIST_KEYS = [
+  { key: "probefahrt", label: "Probefahrt gemacht" },
+  { key: "fluids", label: "Öl-/Flüssigkeiten geprüft" },
+  { key: "errors", label: "Fehler ausgelesen/gelöscht" },
+  { key: "wheels", label: "Radmuttern kontrolliert" },
+  { key: "cleanup", label: "Fahrzeug sauber / Werkstatt sauber" },
+  { key: "invoice", label: "Rechnung erstellt" },
+  { key: "handover", label: "Schlüssel / Abgabe erfolgt" },
+];
 
 function toLocal(iso?: string | null) {
   if (!iso) return "";
@@ -50,24 +64,22 @@ function durationMinutes(start: string, end?: string | null) {
   return Math.max(0, Math.round((e - s) / 60000));
 }
 
-function fmtMin(min: number) {
-  if (min < 60) return `${min} min`;
+function fmtHM(min: number) {
   const h = Math.floor(min / 60);
   const m = min % 60;
+  if (h <= 0) return `${m} min`;
   return `${h} h ${m} min`;
 }
 
-function safeText(s?: string | null) {
-  return (s || "").trim();
-}
-
-function norm(s: string) {
-  return s.toLowerCase().replace(/\s+/g, "");
-}
-
-function isAdminPinOk(pin: string) {
-  if (!ADMIN_PIN) return false;
-  return pin === ADMIN_PIN;
+async function urlToDataUrl(url: string): Promise<string> {
+  const res = await fetch(url);
+  const blob = await res.blob();
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result));
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
 }
 
 export default function JobPage({ params }: { params: { id: string } }) {
@@ -75,14 +87,28 @@ export default function JobPage({ params }: { params: { id: string } }) {
 
   const [job, setJob] = useState<Job | null>(null);
   const [entries, setEntries] = useState<Entry[]>([]);
+  const [photos, setPhotos] = useState<PhotoItem[]>([]);
   const [worker, setWorker] = useState(WORKERS[0]);
   const [task, setTask] = useState(TASKS[0]);
   const [runningId, setRunningId] = useState<string | null>(null);
   const [msg, setMsg] = useState<string>("");
 
-  // Fotos
-  const [photos, setPhotos] = useState<PhotoItem[]>([]);
-  const [photoBusy, setPhotoBusy] = useState(false);
+  // VIN
+  const [vin, setVin] = useState("");
+  const [scanOpen, setScanOpen] = useState(false);
+
+  // checklist
+  const [checklist, setChecklist] = useState<Record<string, boolean>>({});
+
+  // signature
+  const [signName, setSignName] = useState("");
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const drawing = useRef(false);
+
+  // camera scanning
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const scanLoopRef = useRef<number | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
   const done = (job?.status || "open") === "done";
 
@@ -92,17 +118,17 @@ export default function JobPage({ params }: { params: { id: string } }) {
     [jobLink]
   );
 
-  const subtitle = useMemo(() => {
-    const parts = [job?.customer, job?.vehicle, job?.plate].filter(Boolean) as string[];
-    return parts.join(" · ");
-  }, [job]);
-
   async function loadJobAndEntries() {
     setMsg("");
 
     const { data: j, error: je } = await supabase.from("jobs").select("*").eq("id", jobId).single();
     if (je) setMsg(je.message);
-    setJob((j as any) || null);
+
+    const jj = (j as any) as Job | null;
+    setJob(jj);
+
+    setVin(jj?.vin || "");
+    setChecklist((jj?.checklist as any) || {});
 
     const { data: e, error: ee } = await supabase
       .from("time_entries")
@@ -119,35 +145,43 @@ export default function JobPage({ params }: { params: { id: string } }) {
   }
 
   async function loadPhotos() {
-    // Listet die Objekte im Ordner jobId/
-    const { data, error } = await supabase.storage.from(BUCKET).list(jobId, { limit: 100, sortBy: { column: "name", order: "desc" } });
-    if (error) {
-      // Nicht nerven – nur wenn wirklich nötig
-      return;
-    }
+    const { data, error } = await supabase.storage
+      .from(BUCKET)
+      .list(jobId, { limit: 200, sortBy: { column: "name", order: "desc" } });
+
+    if (error) return;
 
     const items: PhotoItem[] = (data || [])
       .filter((x) => x.name && !x.name.endsWith("/"))
-      .map((x) => ({
-        name: x.name,
-        path: `${jobId}/${x.name}`,
-      }));
+      .map((x) => ({ name: x.name, path: `${jobId}/${x.name}` }));
 
-    // Signed URLs (1h)
     const withUrls: PhotoItem[] = [];
     for (const it of items) {
       const { data: s } = await supabase.storage.from(BUCKET).createSignedUrl(it.path, 60 * 60);
       withUrls.push({ ...it, signedUrl: s?.signedUrl || undefined });
     }
-
     setPhotos(withUrls);
   }
 
   useEffect(() => {
+    // letzte Auswahl merken
+    const lastWorker = localStorage.getItem("proauto_last_worker");
+    const lastTask = localStorage.getItem("proauto_last_task");
+    if (lastWorker && WORKERS.includes(lastWorker)) setWorker(lastWorker);
+    if (lastTask && TASKS.includes(lastTask)) setTask(lastTask);
+
     loadJobAndEntries();
     loadPhotos();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    localStorage.setItem("proauto_last_worker", worker);
+  }, [worker]);
+
+  useEffect(() => {
+    localStorage.setItem("proauto_last_task", task);
+  }, [task]);
 
   useEffect(() => {
     const running = entries.find((x) => x.worker === worker && !x.end_ts);
@@ -166,41 +200,51 @@ export default function JobPage({ params }: { params: { id: string } }) {
     return { total, perWorker };
   }, [entries]);
 
-  async function start() {
-    if (done) return setMsg("Auftrag ist abgeschlossen.");
-
-    // Prüfe ob dieser Mitarbeiter irgendwo anders noch „läuft“
-    const { data: otherRunning, error } = await supabase
+  async function checkRunningOtherJob(w: string) {
+    const { data, error } = await supabase
       .from("time_entries")
       .select("id, job_id")
-      .eq("worker", worker)
+      .eq("worker", w)
       .is("end_ts", null)
       .limit(1);
 
-    if (error) return setMsg(error.message);
+    if (error) return { ok: true, otherJobId: null as string | null };
 
-    const r = (otherRunning || [])[0] as any;
-    if (r && r.job_id && r.job_id !== jobId) {
-      const ok = window.confirm(
-        `⚠️ Achtung: ${worker} läuft noch auf einem ANDEREN Auftrag.\n\nWillst du trotzdem auf diesem Auftrag starten? (Das kann Fehler geben)`
-      );
-      if (!ok) return;
+    const r = (data || [])[0] as any;
+    if (!r) return { ok: true, otherJobId: null as string | null };
+
+    if (r.job_id && r.job_id !== jobId) {
+      return { ok: false, otherJobId: r.job_id as string };
+    }
+    return { ok: true, otherJobId: null as string | null };
+  }
+
+  async function startFor(w: string, t: string) {
+    if (done) return setMsg("Auftrag ist abgeschlossen (gesperrt).");
+
+    const chk = await checkRunningOtherJob(w);
+    if (!chk.ok && chk.otherJobId) {
+      setMsg(`⚠️ ${w} läuft bereits auf einem anderen Auftrag.`);
+      const go = confirm(`⚠️ ${w} läuft auf einem anderen Auftrag.\n\nDorthin wechseln?`);
+      if (go) window.location.href = `/job/${chk.otherJobId}`;
+      return;
     }
 
-    // Prüfe ob schon im aktuellen Auftrag läuft
-    const existing = entries.find((e) => e.worker === worker && !e.end_ts);
-    if (existing) return setMsg("Läuft bereits…");
+    const existing = entries.find((e) => e.worker === w && !e.end_ts);
+    if (existing) return setMsg(`${w} läuft bereits…`);
 
-    const { data, error: ie } = await supabase
+    const { data, error } = await supabase
       .from("time_entries")
-      .insert({ job_id: jobId, worker, task })
+      .insert({ job_id: jobId, worker: w, task: t })
       .select("id")
       .single();
 
-    if (ie) return setMsg(ie.message);
+    if (error) return setMsg(error.message);
 
+    setWorker(w);
+    setTask(t);
     setRunningId(data.id);
-    setMsg("✅ läuft…");
+    setMsg(`✅ ${w} läuft…`);
     await loadJobAndEntries();
   }
 
@@ -214,316 +258,438 @@ export default function JobPage({ params }: { params: { id: string } }) {
     await loadJobAndEntries();
   }
 
-  async function closeJob() {
-    if (!job) return;
-
-    const ok = window.confirm("Auftrag wirklich abschliessen? Danach ist Start/Stop gesperrt.");
+  async function closeJobChef() {
+    if (!ensureAdmin(ADMIN_PIN)) return;
+    const ok = confirm("Auftrag wirklich abschliessen? Danach ist Start/Stop gesperrt.");
     if (!ok) return;
 
-    const now = new Date().toISOString();
+    const nowIso = new Date().toISOString();
+    await supabase.from("time_entries").update({ end_ts: nowIso }).eq("job_id", jobId).is("end_ts", null);
 
-    // stoppe alles was läuft
-    await supabase.from("time_entries").update({ end_ts: now }).eq("job_id", jobId).is("end_ts", null);
-
-    // status + closed_at
-    const { error } = await supabase.from("jobs").update({ status: "done", closed_at: now }).eq("id", jobId);
+    const { error } = await supabase.from("jobs").update({ status: "done", closed_at: nowIso }).eq("id", jobId);
     if (error) return setMsg(error.message);
 
     setMsg("✅ Auftrag abgeschlossen");
     await loadJobAndEntries();
   }
 
-  async function reopenJobAdmin() {
-    if (!job) return;
-    const pin = window.prompt("Admin PIN eingeben, um Auftrag wieder zu entsperren:");
-    if (!pin) return;
-
-    if (!isAdminPinOk(pin)) {
-      setMsg("❌ Falscher PIN");
-      return;
-    }
-
+  async function reopenJobChef() {
+    if (!ensureAdmin(ADMIN_PIN)) return;
     const { error } = await supabase.from("jobs").update({ status: "open", closed_at: null }).eq("id", jobId);
     if (error) return setMsg(error.message);
 
-    setMsg("🔓 Auftrag wieder geöffnet");
+    setMsg("🔓 Auftrag wieder offen");
     await loadJobAndEntries();
   }
 
-  function exportCsvBetter() {
-    if (!job) return;
-
-    // Excel DE/CH mag oft ; als Trennzeichen
-    const header = [
-      "Auftrag",
-      "Kunde",
-      "Fahrzeug",
-      "Kontrollschild",
-      "Status",
-      "Mitarbeiter",
-      "Tätigkeit",
-      "Start (lokal)",
-      "Ende (lokal)",
-      "Dauer (min)",
-    ].join(";");
-
-    const rows = entries
-      .slice()
-      .reverse()
-      .map((e) => {
-        const dur = durationMinutes(e.start_ts, e.end_ts);
-        const cols = [
-          job.title,
-          job.customer || "",
-          job.vehicle || "",
-          job.plate || "",
-          job.status || "open",
-          e.worker,
-          e.task || "",
-          toLocal(e.start_ts),
-          e.end_ts ? toLocal(e.end_ts) : "läuft…",
-          String(dur),
-        ].map((x) => `"${String(x).replace(/"/g, '""')}"`);
-        return cols.join(";");
-      });
-
-    // BOM + sep=; damit Excel sauber öffnet
-    const csv = "\uFEFF" + "sep=;\n" + [header, ...rows].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `rapport_${(job.plate || "ohne-kontrollschild").replace(/\s+/g, "_")}_${jobId}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+  async function saveVin() {
+    const v = vin.trim().toUpperCase();
+    if (v && v.length !== 17) {
+      const ok = confirm("VIN ist nicht 17 Zeichen. Trotzdem speichern?");
+      if (!ok) return;
+    }
+    const { error } = await supabase.from("jobs").update({ vin: v || null }).eq("id", jobId);
+    if (error) return setMsg(error.message);
+    setMsg("✅ VIN gespeichert");
+    await loadJobAndEntries();
   }
 
-  function exportPdfAdmin() {
-    const pin = window.prompt("Admin PIN für PDF Rapport:");
-    if (!pin) return;
-    if (!isAdminPinOk(pin)) {
-      setMsg("❌ Falscher PIN");
-      return;
-    }
+  async function saveChecklist(next: Record<string, boolean>) {
+    const { error } = await supabase.from("jobs").update({ checklist: next }).eq("id", jobId);
+    if (error) return setMsg(error.message);
+    setMsg("✅ Checkliste gespeichert");
+    await loadJobAndEntries();
+  }
 
-    // Simple: Druckansicht öffnen -> „Als PDF speichern“
-    const w = window.open("", "_blank");
-    if (!w) return;
-
-    const title = job?.title || "Rapport";
-    const plate = job?.plate || "";
-    const customer = job?.customer || "";
-    const vehicle = job?.vehicle || "";
-
-    const rows = entries
-      .slice()
-      .reverse()
-      .map((e) => {
-        const dur = durationMinutes(e.start_ts, e.end_ts);
-        return `
-          <tr>
-            <td>${e.worker}</td>
-            <td>${e.task || ""}</td>
-            <td>${toLocal(e.start_ts)}</td>
-            <td>${e.end_ts ? toLocal(e.end_ts) : "läuft…"}</td>
-            <td style="text-align:right">${dur}</td>
-          </tr>
-        `;
-      })
-      .join("");
-
-    w.document.write(`
-      <html>
-        <head>
-          <meta charset="utf-8" />
-          <title>${title} – Rapport</title>
-          <style>
-            body{font-family:Arial, sans-serif; padding:24px;}
-            h1{margin:0 0 8px 0;}
-            .meta{color:#444; margin-bottom:16px;}
-            table{width:100%; border-collapse:collapse; margin-top:12px;}
-            th,td{border:1px solid #ddd; padding:8px; font-size:12px;}
-            th{background:#f4f4f4; text-align:left;}
-            .totals{margin-top:12px; font-size:13px;}
-            .right{text-align:right;}
-          </style>
-        </head>
-        <body>
-          <h1>${title}</h1>
-          <div class="meta">
-            <div><b>Kunde:</b> ${customer || "-"}</div>
-            <div><b>Fahrzeug:</b> ${vehicle || "-"}</div>
-            <div><b>Kontrollschild:</b> ${plate || "-"}</div>
-            <div><b>Status:</b> ${(job?.status || "open") === "done" ? "Abgeschlossen" : "Offen"}</div>
-            <div><b>Erstellt:</b> ${job?.created_at ? toLocal(job.created_at) : "-"}</div>
-            <div><b>Abgeschlossen:</b> ${job?.closed_at ? toLocal(job.closed_at) : "-"}</div>
-          </div>
-
-          <table>
-            <thead>
-              <tr>
-                <th>Mitarbeiter</th>
-                <th>Tätigkeit</th>
-                <th>Start</th>
-                <th>Ende</th>
-                <th class="right">Min</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${rows || `<tr><td colspan="5">Keine Einträge</td></tr>`}
-            </tbody>
-          </table>
-
-          <div class="totals">
-            <b>Total:</b> ${fmtMin(totals.total)}
-            <div style="margin-top:6px">
-              ${Object.entries(totals.perWorker)
-                .map(([w2, m]) => `<div>${w2}: ${fmtMin(m)}</div>`)
-                .join("")}
-            </div>
-          </div>
-
-          <script>
-            window.onload = () => window.print();
-          </script>
-        </body>
-      </html>
-    `);
-
-    w.document.close();
+  function toggleChecklist(key: string) {
+    const next = { ...(checklist || {}) };
+    next[key] = !next[key];
+    setChecklist(next);
+    saveChecklist(next);
   }
 
   async function uploadPhoto(file: File) {
     if (!file) return;
-    setPhotoBusy(true);
-    setMsg("");
+    setMsg("⏳ Foto wird hochgeladen…");
 
-    try {
-      const ext = (file.name.split(".").pop() || "jpg").toLowerCase();
-      const safeExt = ext.replace(/[^a-z0-9]/g, "") || "jpg";
-      const fname = `${new Date().toISOString().replace(/[:.]/g, "-")}_${Math.random().toString(16).slice(2)}.${safeExt}`;
-      const path = `${jobId}/${fname}`;
+    const ext = (file.name.split(".").pop() || "jpg").toLowerCase().replace(/[^a-z0-9]/g, "") || "jpg";
+    const fname = `${new Date().toISOString().replace(/[:.]/g, "-")}_${Math.random().toString(16).slice(2)}.${ext}`;
+    const path = `${jobId}/${fname}`;
 
-      const { error } = await supabase.storage.from(BUCKET).upload(path, file, {
-        cacheControl: "3600",
-        upsert: false,
-        contentType: file.type || "image/jpeg",
-      });
+    const { error } = await supabase.storage.from(BUCKET).upload(path, file, {
+      cacheControl: "3600",
+      upsert: false,
+      contentType: file.type || "image/jpeg",
+    });
+    if (error) return setMsg(`❌ Upload Fehler: ${error.message}`);
 
-      if (error) {
-        setMsg(`❌ Foto Upload Fehler: ${error.message}`);
-        return;
-      }
-
-      setMsg("📸 Foto gespeichert");
-      await loadPhotos();
-    } finally {
-      setPhotoBusy(false);
-    }
+    setMsg("📸 Foto gespeichert");
+    await loadPhotos();
   }
 
-  async function deletePhotoAdmin(p: PhotoItem) {
-    const pin = window.prompt("Admin PIN zum Löschen:");
-    if (!pin) return;
-    if (!isAdminPinOk(pin)) {
-      setMsg("❌ Falscher PIN");
-      return;
-    }
-
+  async function deletePhotoChef(p: PhotoItem) {
+    if (!ensureAdmin(ADMIN_PIN)) return;
     const { error } = await supabase.storage.from(BUCKET).remove([p.path]);
-    if (error) {
-      setMsg(`❌ Löschen fehlgeschlagen: ${error.message}`);
-      return;
-    }
+    if (error) return setMsg(`❌ Löschen fehlgeschlagen: ${error.message}`);
     setMsg("🗑️ Foto gelöscht");
     await loadPhotos();
   }
 
+  // ---- Signature pad
+  function canvasSizeFix() {
+    const c = canvasRef.current;
+    if (!c) return;
+    const rect = c.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    c.width = Math.floor(rect.width * dpr);
+    c.height = Math.floor(200 * dpr);
+    const ctx = c.getContext("2d");
+    if (ctx) {
+      ctx.scale(dpr, dpr);
+      ctx.fillStyle = "rgba(255,255,255,0.02)";
+      ctx.fillRect(0, 0, rect.width, 200);
+      ctx.strokeStyle = "rgba(255,255,255,0.85)";
+      ctx.lineWidth = 2;
+      ctx.lineCap = "round";
+    }
+  }
+
+  useEffect(() => {
+    canvasSizeFix();
+  }, []);
+
+  function getPos(e: any) {
+    const c = canvasRef.current!;
+    const rect = c.getBoundingClientRect();
+    const x = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
+    const y = (e.touches ? e.touches[0].clientY : e.clientY) - rect.top;
+    return { x, y };
+  }
+
+  function startDraw(e: any) {
+    drawing.current = true;
+    const c = canvasRef.current;
+    if (!c) return;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    const { x, y } = getPos(e);
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    e.preventDefault?.();
+  }
+
+  function moveDraw(e: any) {
+    if (!drawing.current) return;
+    const c = canvasRef.current;
+    if (!c) return;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    const { x, y } = getPos(e);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+    e.preventDefault?.();
+  }
+
+  function endDraw() {
+    drawing.current = false;
+  }
+
+  function clearSignature() {
+    const c = canvasRef.current;
+    if (!c) return;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    const rect = c.getBoundingClientRect();
+    ctx.clearRect(0, 0, rect.width, 200);
+    ctx.fillStyle = "rgba(255,255,255,0.02)";
+    ctx.fillRect(0, 0, rect.width, 200);
+    setMsg("Unterschrift gelöscht (lokal).");
+  }
+
+  async function saveSignatureChef() {
+    if (!ensureAdmin(ADMIN_PIN)) return;
+
+    if (!signName.trim()) {
+      alert("Bitte Name für Unterschrift eingeben.");
+      return;
+    }
+
+    const c = canvasRef.current;
+    if (!c) return;
+    const dataUrl = c.toDataURL("image/png");
+    const res = await fetch(dataUrl);
+    const blob = await res.blob();
+
+    const path = `${jobId}/signature.png`;
+    const { error } = await supabase.storage.from(BUCKET).upload(path, blob, {
+      cacheControl: "3600",
+      upsert: true,
+      contentType: "image/png",
+    });
+    if (error) return setMsg(`❌ Signatur Upload Fehler: ${error.message}`);
+
+    const { data: signed } = await supabase.storage.from(BUCKET).createSignedUrl(path, 60 * 60);
+    const signedUrl = signed?.signedUrl || null;
+
+    const { error: e2 } = await supabase
+      .from("jobs")
+      .update({
+        signature_url: signedUrl,
+        signature_name: signName.trim(),
+        signature_at: new Date().toISOString(),
+      })
+      .eq("id", jobId);
+
+    if (e2) return setMsg(e2.message);
+
+    setMsg("✅ Unterschrift gespeichert");
+    await loadJobAndEntries();
+    await loadPhotos();
+  }
+
+  // ---- VIN scan
+  async function openScan() {
+    setScanOpen(true);
+    setMsg("");
+    setTimeout(() => startScanLoop(), 150);
+  }
+
+  async function startScanLoop() {
+    try {
+      if (!videoRef.current) return;
+
+      // @ts-ignore
+      const hasBD = typeof window !== "undefined" && "BarcodeDetector" in window;
+      if (!hasBD) {
+        alert("VIN-Scan wird auf diesem Gerät/Browser nicht unterstützt. Bitte VIN manuell eingeben.");
+        setScanOpen(false);
+        return;
+      }
+
+      streamRef.current = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      videoRef.current.srcObject = streamRef.current;
+      await videoRef.current.play();
+
+      // @ts-ignore
+      const detector = new window.BarcodeDetector({
+        formats: ["code_128", "code_39", "qr_code", "ean_13", "ean_8"],
+      });
+
+      const loop = async () => {
+        if (!videoRef.current) return;
+        try {
+          // @ts-ignore
+          const codes = await detector.detect(videoRef.current);
+          if (codes && codes.length > 0) {
+            const raw = (codes[0].rawValue || "").toString().trim().toUpperCase();
+            if (raw.length >= 10) {
+              setVin(raw.slice(0, 17));
+              stopScan();
+              setScanOpen(false);
+              setMsg("✅ Scan erkannt – VIN übernehmen & speichern.");
+              return;
+            }
+          }
+        } catch {}
+        scanLoopRef.current = window.requestAnimationFrame(loop);
+      };
+
+      scanLoopRef.current = window.requestAnimationFrame(loop);
+    } catch (e: any) {
+      alert("Kamera Fehler: " + (e?.message || "Unbekannt"));
+      setScanOpen(false);
+      stopScan();
+    }
+  }
+
+  function stopScan() {
+    if (scanLoopRef.current) cancelAnimationFrame(scanLoopRef.current);
+    scanLoopRef.current = null;
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+  }
+
+  useEffect(() => {
+    return () => stopScan();
+  }, []);
+
+  // ---- PDF (Chef)
+  async function exportPdfChef() {
+    if (!ensureAdmin(ADMIN_PIN)) return;
+    if (!job) return;
+
+    setMsg("⏳ PDF wird erstellt…");
+
+    const jsPDFMod = await import("jspdf");
+    const autoTableMod = await import("jspdf-autotable");
+    const jsPDF = (jsPDFMod as any).jsPDF;
+    const autoTable = (autoTableMod as any).default;
+
+    const doc = new jsPDF({ orientation: "p", unit: "mm", format: "a4" });
+
+    try {
+      const logoDataUrl = await urlToDataUrl("/logo.png");
+      doc.addImage(logoDataUrl, "PNG", 14, 10, 18, 18);
+    } catch {}
+
+    doc.setFontSize(16);
+    doc.text("Pro Automobile – Rapport", 36, 18);
+
+    doc.setFontSize(10);
+    const infoLines = [
+      `Auftrag: ${job.title}`,
+      `Kunde: ${job.customer || ""}`,
+      `Fahrzeug: ${job.vehicle || ""}`,
+      `Kontrollschild: ${job.plate || ""}`,
+      `VIN: ${job.vin || ""}`,
+      `Status: ${(job.status || "open") === "done" ? "Abgeschlossen" : "Offen"}`,
+      job.closed_at ? `Abgeschlossen: ${toLocal(job.closed_at)}` : "",
+    ].filter(Boolean);
+
+    let y = 32;
+    for (const line of infoLines) {
+      doc.text(line, 14, y);
+      y += 5;
+    }
+
+    const body = entries
+      .slice()
+      .reverse()
+      .map((e) => {
+        const min = durationMinutes(e.start_ts, e.end_ts);
+        return [e.worker, e.task || "", toLocal(e.start_ts), e.end_ts ? toLocal(e.end_ts) : "läuft…", String(min), fmtHM(min)];
+      });
+
+    autoTable(doc, {
+      startY: y + 2,
+      head: [["Mitarbeiter", "Tätigkeit", "Start", "Ende", "Min", "Dauer"]],
+      body: body.length ? body : [["-", "-", "-", "-", "-", "-"]],
+      styles: { fontSize: 9 },
+      headStyles: { fillColor: [20, 20, 20] },
+    });
+
+    const afterTableY = (doc as any).lastAutoTable?.finalY || 120;
+
+    doc.setFontSize(12);
+    doc.text("Checkliste", 14, afterTableY + 10);
+    doc.setFontSize(10);
+    let cy = afterTableY + 16;
+    for (const it of CHECKLIST_KEYS) {
+      const val = !!(checklist || {})[it.key];
+      doc.text(`${val ? "☑" : "☐"} ${it.label}`, 14, cy);
+      cy += 5;
+      if (cy > 270) break;
+    }
+
+    const photoCandidates = photos
+      .filter((p) => p.signedUrl)
+      .filter((p) => !p.name.toLowerCase().includes("signature"))
+      .slice(0, 6);
+
+    if (photoCandidates.length > 0) {
+      doc.setFontSize(12);
+      doc.text("Fotos (Auszug)", 14, cy + 6);
+      cy += 12;
+
+      let x = 14;
+      let rowH = 0;
+
+      for (const p of photoCandidates) {
+        try {
+          const dataUrl = await urlToDataUrl(p.signedUrl!);
+          const w = 40;
+          const h = 30;
+          doc.addImage(dataUrl, "JPEG", x, cy, w, h);
+          rowH = Math.max(rowH, h);
+          x += w + 6;
+          if (x > 160) {
+            x = 14;
+            cy += rowH + 8;
+            rowH = 0;
+          }
+        } catch {}
+      }
+      cy += rowH + 8;
+    }
+
+    if (job.signature_url && job.signature_name) {
+      doc.setFontSize(12);
+      doc.text("Unterschrift", 14, cy + 6);
+      cy += 10;
+
+      try {
+        const sigData = await urlToDataUrl(job.signature_url);
+        doc.addImage(sigData, "PNG", 14, cy, 70, 24);
+      } catch {}
+
+      doc.setFontSize(10);
+      doc.text(`${job.signature_name} · ${job.signature_at ? toLocal(job.signature_at) : ""}`, 90, cy + 14);
+      cy += 30;
+    }
+
+    const totalMin = totals.total;
+    doc.setFontSize(12);
+    doc.text(`TOTAL: ${fmtHM(totalMin)} (${totalMin} min)`, 14, Math.min(cy + 6, 285));
+
+    const fileName = `rapport_${(job.plate || "ohne-kennzeichen").replace(/\s+/g, "_")}_${jobId}.pdf`;
+    doc.save(fileName);
+
+    setMsg("✅ PDF erstellt");
+  }
+
+  async function refreshAll() {
+    await loadJobAndEntries();
+    await loadPhotos();
+    setMsg("Aktualisiert");
+  }
+
   return (
-    <div style={{ maxWidth: 980, margin: "0 auto", padding: 14 }}>
+    <div className="container">
       <a href="/" style={{ textDecoration: "none", color: "inherit", opacity: 0.85 }}>
         ← zurück
       </a>
 
-      {/* Header */}
-      <div className="card" style={{ marginTop: 12 }}>
-        <div className="row" style={{ alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-          <div style={{ display: "flex", gap: 12, alignItems: "center", minWidth: 0 }}>
-            <div
-              style={{
-                width: 56,
-                height: 56,
-                borderRadius: 16,
-                background: "rgba(255,255,255,0.08)",
-                display: "grid",
-                placeItems: "center",
-                overflow: "hidden",
-              }}
-            >
-              {/* Logo sichtbar (falls PNG/SVG) */}
-              <img src="/logo.png" alt="Pro Automobile" style={{ width: 44, height: 44, objectFit: "contain" }} />
-            </div>
-
-            <div style={{ minWidth: 0 }}>
-              <div className="h1" style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 520 }}>
-                  {job?.title || "Auftrag"}
-                </span>
-                <span
-                  style={{
-                    fontSize: 12,
-                    padding: "6px 10px",
-                    borderRadius: 999,
-                    background: done ? "rgba(34,197,94,0.18)" : "rgba(239,68,68,0.18)",
-                    border: done ? "1px solid rgba(34,197,94,0.35)" : "1px solid rgba(239,68,68,0.35)",
-                    color: done ? "#86efac" : "#fecaca",
-                  }}
-                >
-                  {done ? "Abgeschlossen" : "Offen"}
-                </span>
-              </div>
-
-              <div className="muted" style={{ marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {subtitle || "—"}
-              </div>
-
-              <div className="muted" style={{ marginTop: 6, fontSize: 12 }}>
-                {msg ? msg : done ? "Start/Stop gesperrt (Auftrag abgeschlossen)." : "Bereit."}
-              </div>
-            </div>
-          </div>
-
-          {/* QR */}
+      <div className="card">
+        <div className="row">
           <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-            <div style={{ textAlign: "right" }}>
-              <div className="muted" style={{ fontSize: 12 }}>
-                QR-Link (scannen)
-              </div>
-              <div className="muted" style={{ fontSize: 11, maxWidth: 220, wordBreak: "break-all", opacity: 0.65 }}>
-                {jobLink}
+            <div className="logoWrap">
+              <img src="/logo.png" alt="Pro Automobile" />
+            </div>
+            <div>
+              <div className="h1">{job?.title || "Auftrag"}</div>
+              <div className="muted">{[job?.customer, job?.vehicle, job?.plate].filter(Boolean).join(" · ")}</div>
+              <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                {msg}
               </div>
             </div>
-            <img src={qrUrl} alt="QR" style={{ width: 108, height: 108, borderRadius: 16 }} />
           </div>
+
+          <span className={"badge " + (done ? "badgeDone" : "")}>
+            <span className="badgeDot" />
+            {done ? "Abgeschlossen" : "Offen"}
+          </span>
         </div>
       </div>
 
-      {/* Start/Stop */}
-      <div className="card" style={{ marginTop: 12 }}>
+      <div className="card">
         <div className="row">
-          <div className="h2">Start / Stop</div>
+          <div>
+            <div className="h2">QR-Link (Auftrag scannen)</div>
+            <div className="muted" style={{ fontSize: 13, wordBreak: "break-all" }}>
+              {jobLink}
+            </div>
+          </div>
+          <img src={qrUrl} alt="QR" style={{ width: 140, height: 140, borderRadius: 16 }} />
         </div>
+      </div>
+
+      <div className="card">
+        <div className="h2">Quick Start (1 Klick)</div>
 
         <div className="grid2" style={{ marginTop: 10 }}>
-          <select className="select" value={worker} onChange={(e) => setWorker(e.target.value)}>
-            {WORKERS.map((w) => (
-              <option key={w} value={w}>
-                {w}
-              </option>
-            ))}
-          </select>
-
           <select className="select" value={task} onChange={(e) => setTask(e.target.value)}>
             {TASKS.map((t) => (
               <option key={t} value={t}>
@@ -531,178 +697,224 @@ export default function JobPage({ params }: { params: { id: string } }) {
               </option>
             ))}
           </select>
+          <button className="btn btnDark" onClick={refreshAll}>
+            Aktualisieren
+          </button>
+        </div>
+
+        <div className="grid3" style={{ marginTop: 10 }}>
+          {WORKERS.map((w) => (
+            <button key={w} className="btn btnPrimary" disabled={done} onClick={() => startFor(w, task)}>
+              {w} START
+            </button>
+          ))}
         </div>
 
         <div className="grid2" style={{ marginTop: 10 }}>
-          <button className="btn btnPrimary" onClick={start} disabled={!!runningId || done}>
-            Start
-          </button>
           <button className="btn btnDark" onClick={stop} disabled={!runningId}>
-            Stop
+            Stop (aktueller Mitarbeiter)
           </button>
-        </div>
-
-        {/* Buttons Block */}
-        <div className="grid2" style={{ marginTop: 10 }}>
-          <button className="btn btnDanger" onClick={closeJob} disabled={done}>
-            Auftrag abschliessen ✅
-          </button>
-          <button className="btn" onClick={exportCsvBetter}>
-            CSV Rapport (Excel sauber)
+          <button className="btn btnDanger" onClick={closeJobChef} disabled={done}>
+            Auftrag abschliessen (Chef)
           </button>
         </div>
 
         <div className="grid2" style={{ marginTop: 10 }}>
-          <button className="btn" onClick={reopenJobAdmin} disabled={!done}>
-            🔓 Auftrag entsperren (Admin PIN)
+          <button className="btn btnDark" onClick={reopenJobChef} disabled={!done}>
+            Auftrag entsperren (Chef)
           </button>
-          <button className="btn" onClick={exportPdfAdmin}>
-            🧾 PDF Rapport (Admin PIN)
+          <button className="btn btnDark" onClick={exportPdfChef}>
+            PDF Rapport (Chef)
           </button>
         </div>
       </div>
 
-      {/* Fotos */}
-      <div className="card" style={{ marginTop: 12 }}>
-        <div className="row" style={{ alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+      <div className="card">
+        <div className="row">
           <div>
-            <div className="h2">Fotos (Schäden)</div>
+            <div className="h2">VIN</div>
             <div className="muted" style={{ fontSize: 12 }}>
-              Foto machen / hochladen → wird beim Auftrag gespeichert.
+              Manuell eintragen oder scannen (wenn Browser unterstützt).
+            </div>
+          </div>
+          <button className="btn btnDark" style={{ width: 180 }} onClick={openScan}>
+            VIN scannen
+          </button>
+        </div>
+
+        <div className="grid2" style={{ marginTop: 10 }}>
+          <input className="input" placeholder="VIN (17 Zeichen)" value={vin} onChange={(e) => setVin(e.target.value.toUpperCase())} />
+          <button className="btn btnPrimary" onClick={saveVin}>
+            VIN speichern
+          </button>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="h2">Checkliste Kontrolle / Abgabe</div>
+        <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+          {CHECKLIST_KEYS.map((it) => (
+            <label key={it.key} style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              <input type="checkbox" checked={!!checklist?.[it.key]} onChange={() => toggleChecklist(it.key)} style={{ width: 20, height: 20 }} />
+              <span>{it.label}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="row">
+          <div>
+            <div className="h2">Fotos / Schäden</div>
+            <div className="muted" style={{ fontSize: 12 }}>
+              Bucket ist privat: App zeigt Fotos via Signed-Links.
             </div>
           </div>
 
-          <label
-            className="btn"
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 10,
-              cursor: photoBusy ? "not-allowed" : "pointer",
-              opacity: photoBusy ? 0.7 : 1,
-            }}
-          >
+          <label className="btn btnPrimary" style={{ width: 220, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>
             📸 Foto hinzufügen
             <input
               type="file"
               accept="image/*"
               capture="environment"
               style={{ display: "none" }}
-              disabled={photoBusy}
               onChange={(e) => {
                 const f = e.target.files?.[0];
                 if (f) uploadPhoto(f);
-                // reset input
                 e.currentTarget.value = "";
               }}
             />
           </label>
         </div>
 
-        {photos.length === 0 ? (
+        {photos.filter((p) => !p.name.toLowerCase().includes("signature")).length === 0 ? (
           <div className="muted" style={{ marginTop: 10 }}>
             Noch keine Fotos.
           </div>
         ) : (
-          <div
-            style={{
-              marginTop: 12,
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))",
-              gap: 12,
-            }}
-          >
-            {photos.map((p) => (
-              <div
-                key={p.path}
-                style={{
-                  borderRadius: 16,
-                  overflow: "hidden",
-                  background: "rgba(255,255,255,0.06)",
-                  border: "1px solid rgba(255,255,255,0.08)",
-                }}
-              >
-                <a href={p.signedUrl || "#"} target="_blank" rel="noreferrer" style={{ display: "block" }}>
-                  <img
-                    src={p.signedUrl || ""}
-                    alt={p.name}
-                    style={{ width: "100%", height: 140, objectFit: "cover", display: "block" }}
-                  />
-                </a>
-                <div style={{ padding: 10, display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
-                  <div className="muted" style={{ fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {p.name}
+          <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 12 }}>
+            {photos
+              .filter((p) => !p.name.toLowerCase().includes("signature"))
+              .map((p) => (
+                <div key={p.path} style={{ borderRadius: 16, overflow: "hidden", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.08)" }}>
+                  <a href={p.signedUrl || "#"} target="_blank" rel="noreferrer" style={{ display: "block" }}>
+                    <img src={p.signedUrl || ""} alt={p.name} style={{ width: "100%", height: 140, objectFit: "cover", display: "block" }} />
+                  </a>
+                  <div style={{ padding: 10, display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                    <div className="muted" style={{ fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</div>
+                    <button className="btn btnDark" style={{ padding: "8px 10px" }} onClick={() => deletePhotoChef(p)}>
+                      🗑️ (Chef)
+                    </button>
                   </div>
-                  <button className="btn" style={{ padding: "8px 10px" }} onClick={() => deletePhotoAdmin(p)}>
-                    🗑️
-                  </button>
                 </div>
-              </div>
-            ))}
+              ))}
           </div>
         )}
       </div>
 
-      {/* Rapport */}
-      <div className="card" style={{ marginTop: 12 }}>
-        <div className="row" style={{ alignItems: "flex-end", justifyContent: "space-between" }}>
-          <div>
-            <div className="h2">Rapport</div>
-            <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-              <b>Total:</b> {fmtMin(totals.total)}
-            </div>
-            <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
-              {Object.entries(totals.perWorker).map(([w, m]) => (
-                <div key={w}>
-                  {w}: {fmtMin(m)}
-                </div>
-              ))}
-            </div>
-          </div>
+      <div className="card">
+        <div className="h2">Unterschrift (Chef)</div>
+        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+          Nur Chef kann speichern. Wird im PDF angezeigt.
+        </div>
 
-          <button className="btn" onClick={loadJobAndEntries}>
-            Aktualisieren
+        <div className="grid2" style={{ marginTop: 10 }}>
+          <input className="input" placeholder="Name (z.B. Kunde)" value={signName} onChange={(e) => setSignName(e.target.value)} />
+          <button className="btn btnPrimary" onClick={saveSignatureChef}>
+            Unterschrift speichern (Chef)
           </button>
+        </div>
+
+        <div style={{ marginTop: 10, border: "1px solid rgba(255,255,255,.10)", borderRadius: 16, overflow: "hidden" }}>
+          <canvas
+            ref={canvasRef}
+            style={{ width: "100%", height: 200, display: "block", background: "rgba(255,255,255,0.02)" }}
+            onMouseDown={startDraw}
+            onMouseMove={moveDraw}
+            onMouseUp={endDraw}
+            onMouseLeave={endDraw}
+            onTouchStart={startDraw}
+            onTouchMove={moveDraw}
+            onTouchEnd={endDraw}
+          />
+        </div>
+
+        <div className="grid2" style={{ marginTop: 10 }}>
+          <button className="btn btnDark" onClick={clearSignature}>
+            Clear
+          </button>
+          <button className="btn btnDark" onClick={refreshAll}>
+            Reload
+          </button>
+        </div>
+
+        {job?.signature_name && (
+          <div className="muted" style={{ marginTop: 10 }}>
+            ✅ Gespeichert: <b>{job.signature_name}</b> {job.signature_at ? `· ${toLocal(job.signature_at)}` : ""}
+          </div>
+        )}
+      </div>
+
+      <div className="card">
+        <div className="h2">Rapport</div>
+        <div style={{ marginTop: 8 }}>
+          <b>Total:</b> {fmtHM(totals.total)}
+        </div>
+
+        <div style={{ marginTop: 8 }}>
+          {Object.entries(totals.perWorker).map(([w, m]) => (
+            <div key={w} className="muted">
+              {w}: {fmtHM(m)}
+            </div>
+          ))}
         </div>
 
         <div style={{ marginTop: 12, overflowX: "auto" }}>
           <table style={{ width: "100%", borderCollapse: "collapse" }}>
             <thead>
               <tr>
-                <th style={{ textAlign: "left", padding: 10, opacity: 0.7 }}>Mitarbeiter</th>
-                <th style={{ textAlign: "left", padding: 10, opacity: 0.7 }}>Tätigkeit</th>
-                <th style={{ textAlign: "left", padding: 10, opacity: 0.7 }}>Start</th>
-                <th style={{ textAlign: "left", padding: 10, opacity: 0.7 }}>Ende</th>
-                <th style={{ textAlign: "right", padding: 10, opacity: 0.7 }}>Min</th>
+                <th style={{ textAlign: "left", padding: 8, opacity: 0.7 }}>Mitarbeiter</th>
+                <th style={{ textAlign: "left", padding: 8, opacity: 0.7 }}>Tätigkeit</th>
+                <th style={{ textAlign: "left", padding: 8, opacity: 0.7 }}>Start</th>
+                <th style={{ textAlign: "left", padding: 8, opacity: 0.7 }}>Ende</th>
+                <th style={{ textAlign: "right", padding: 8, opacity: 0.7 }}>Min</th>
               </tr>
             </thead>
             <tbody>
-              {entries.length === 0 ? (
-                <tr>
-                  <td colSpan={5} style={{ padding: 10, opacity: 0.7 }}>
-                    Keine Einträge
-                  </td>
+              {entries.map((e) => (
+                <tr key={e.id} style={{ borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+                  <td style={{ padding: 8 }}>{e.worker}</td>
+                  <td style={{ padding: 8 }}>{e.task || ""}</td>
+                  <td style={{ padding: 8 }}>{toLocal(e.start_ts)}</td>
+                  <td style={{ padding: 8 }}>{e.end_ts ? toLocal(e.end_ts) : <b>läuft…</b>}</td>
+                  <td style={{ padding: 8, textAlign: "right" }}>{durationMinutes(e.start_ts, e.end_ts)}</td>
                 </tr>
-              ) : (
-                entries.map((e) => (
-                  <tr key={e.id} style={{ borderTop: "1px solid rgba(255,255,255,0.06)" }}>
-                    <td style={{ padding: 10 }}>{e.worker}</td>
-                    <td style={{ padding: 10 }}>{e.task || ""}</td>
-                    <td style={{ padding: 10 }}>{toLocal(e.start_ts)}</td>
-                    <td style={{ padding: 10 }}>{e.end_ts ? toLocal(e.end_ts) : <b>läuft…</b>}</td>
-                    <td style={{ padding: 10, textAlign: "right" }}>{durationMinutes(e.start_ts, e.end_ts)}</td>
-                  </tr>
-                ))
-              )}
+              ))}
             </tbody>
           </table>
         </div>
-
-        <div className="muted" style={{ marginTop: 12, fontSize: 12, opacity: 0.75 }}>
-          Tipp: Auf Samsung Chrome → ⋮ → <b>„Zum Startbildschirm“</b> (App installieren). <br />
-          Auf iPhone Safari → <b>Teilen</b> → <b>„Zum Home-Bildschirm“</b>.
-        </div>
       </div>
+
+      {scanOpen && (
+        <div className="modalBack" onClick={() => { setScanOpen(false); stopScan(); }}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="row">
+              <div className="h2">VIN Scan</div>
+              <button className="btn btnDark" style={{ width: 140 }} onClick={() => { setScanOpen(false); stopScan(); }}>
+                Schliessen
+              </button>
+            </div>
+
+            <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+              Halte Kamera auf VIN Barcode / QR / Code128 (wenn vorhanden). Wenn dein Gerät das nicht kann → VIN manuell.
+            </div>
+
+            <div style={{ marginTop: 10, borderRadius: 16, overflow: "hidden", border: "1px solid rgba(255,255,255,.10)" }}>
+              <video ref={videoRef} style={{ width: "100%", display: "block" }} playsInline />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
