@@ -3,8 +3,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "../../lib/supabaseClient";
 import { ensureAdmin } from "../../lib/admin";
-import jsPDF from "jspdf";
-import autoTable from "jspdf-autotable";
 
 type Job = {
   id: string;
@@ -12,12 +10,11 @@ type Job = {
   customer: string | null;
   vehicle: string | null;
   plate: string | null;
-  status: string | null; // open | done
+  status: string | null;
   created_at?: string | null;
   closed_at?: string | null;
 
-  km_photo_url?: string | null;
-  signature_url?: string | null;
+  signature_url?: string | null; // wir speichern hier entweder URL ODER storage-path
   signature_name?: string | null;
   signature_at?: string | null;
 };
@@ -31,17 +28,12 @@ type Entry = {
   end_ts: string | null;
 };
 
-type PhotoItem = {
-  id: string;
-  job_id: string;
-  url: string;
-  created_at?: string | null;
-};
-
 const WORKERS = ["Esteban", "Eron", "Jeremie", "Tsvetan", "Mensel"];
-const TASKS = ["Service", "Diagnose", "Bremsen", "Reifen", "MFK", "Elektrik", "Klima", "Probefahrt"];
+const TASKS = ["Service", "Diagnose", "Bremsen", "Reifen", "MFK", "Elektrik", "Klima", "Probefahrt", "Sonstiges"];
+
 const BUCKET = "job-photos";
 
+// ---------- Helpers ----------
 function toLocal(iso?: string | null) {
   if (!iso) return "";
   const d = new Date(iso);
@@ -61,37 +53,63 @@ function fmtMin(min: number) {
   return `${h}h ${m}min`;
 }
 
-async function uploadToBucket(path: string, file: File) {
-  const { error } = await supabase.storage.from(BUCKET).upload(path, file, {
-    upsert: true,
-    cacheControl: "3600",
-    contentType: file.type,
+async function fetchAsDataUrl(url: string): Promise<string> {
+  const res = await fetch(url);
+  const blob = await res.blob();
+  return await new Promise<string>((resolve) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result));
+    r.readAsDataURL(blob);
   });
-  if (error) throw error;
-
-  const { data } = supabase.storage.from(BUCKET).getPublicUrl(path);
-  return data.publicUrl;
 }
 
+// erkennt “km” / “ausweis” auch bei alten, random names (z.B. durch UI/Browser)
+function looksLikeKm(name: string) {
+  const n = name.toLowerCase();
+  return n.startsWith("km_") || n.includes("kilometer") || /(^|[_-])km([_-]|\.|$)/i.test(n);
+}
+function looksLikeAusweis(name: string) {
+  const n = name.toLowerCase();
+  return n.startsWith("ausweis_") || n.includes("fahrzeugausweis") || n.includes("ausweis") || /(^|[_-])ausweis([_-]|\.|$)/i.test(n);
+}
+function looksLikeDamage(name: string) {
+  const n = name.toLowerCase();
+  return n.startsWith("schaden_") || n.includes("schaden");
+}
+
+type PhotoItem = { path: string; name: string; url: string };
+
+// ---------- Page ----------
 export default function JobPage({ params }: { params: { id: string } }) {
   const jobId = params.id;
-
-  const ADMIN_PIN = process.env.NEXT_PUBLIC_ADMIN_PIN || "";
+  const adminPin = process.env.NEXT_PUBLIC_ADMIN_PIN || "";
 
   const [job, setJob] = useState<Job | null>(null);
   const [entries, setEntries] = useState<Entry[]>([]);
-  const [photos, setPhotos] = useState<PhotoItem[]>([]);
   const [worker, setWorker] = useState(WORKERS[0]);
   const [task, setTask] = useState(TASKS[0]);
   const [runningId, setRunningId] = useState<string | null>(null);
   const [msg, setMsg] = useState<string>("");
 
-  const [kmFile, setKmFile] = useState<File | null>(null);
-  const [damageFile, setDamageFile] = useState<File | null>(null);
+  // Fotos
+  const [photos, setPhotos] = useState<PhotoItem[]>([]);
+  const [busyPdf, setBusyPdf] = useState(false);
 
-  // signature
+  // Pflicht-Foto Auswahl + Upload Buttons (dein “Variante B” Stil)
+  const [kmFile, setKmFile] = useState<File | null>(null);
+  const [ausweisFile, setAusweisFile] = useState<File | null>(null);
+  const [busyUploadKm, setBusyUploadKm] = useState(false);
+  const [busyUploadAusweis, setBusyUploadAusweis] = useState(false);
+
+  // Schaden Foto direkt Upload
+  const [busyUploadDamage, setBusyUploadDamage] = useState(false);
+
+  // Unterschrift
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [sigName, setSigName] = useState("");
+  const [signName, setSignName] = useState("");
+  const [signBusy, setSignBusy] = useState(false);
+
+  const done = (job?.status || "open") === "done";
 
   const jobLink = useMemo(() => (typeof window !== "undefined" ? window.location.href : ""), []);
   const qrUrl = useMemo(
@@ -99,7 +117,76 @@ export default function JobPage({ params }: { params: { id: string } }) {
     [jobLink]
   );
 
-  const done = (job?.status || "open") === "done";
+  const requiredOk = useMemo(() => {
+    // wir prüfen über Storage-Liste (robust, inkl. alt/random Names)
+    const hasAusweis = photos.some((p) => looksLikeAusweis(p.name));
+    const hasKm = photos.some((p) => looksLikeKm(p.name));
+    return { hasAusweis, hasKm, ok: hasAusweis && hasKm };
+  }, [photos]);
+
+  const kmPhoto = useMemo(() => photos.find((p) => looksLikeKm(p.name)) || null, [photos]);
+  const ausweisPhoto = useMemo(() => photos.find((p) => looksLikeAusweis(p.name)) || null, [photos]);
+  const damagePhotos = useMemo(() => photos.filter((p) => looksLikeDamage(p.name)), [photos]);
+
+  async function refreshPhotos() {
+    const { data, error } = await supabase.storage.from(BUCKET).list(jobId, {
+      limit: 200,
+      sortBy: { column: "created_at", order: "desc" },
+    });
+
+    if (error) {
+      console.warn("photo list error:", error.message);
+      setPhotos([]);
+      return;
+    }
+
+    const items = (data || []).filter((x) => x.name && x.name !== ".emptyFolderPlaceholder");
+    const out: PhotoItem[] = [];
+
+    for (const it of items) {
+      const path = `${jobId}/${it.name}`;
+      const { data: signed } = await supabase.storage.from(BUCKET).createSignedUrl(path, 60 * 60 * 24 * 7);
+      if (signed?.signedUrl) out.push({ path, name: it.name, url: signed.signedUrl });
+    }
+
+    setPhotos(out);
+  }
+
+  async function uploadPhoto(file: File, kind: "ausweis" | "km" | "schaden") {
+    // WICHTIG: wir erzwingen IMMER sauberes Naming -> Pflicht-Erkennung klappt fix.
+    const extRaw = (file.name.split(".").pop() || "jpg").toLowerCase();
+    const ext = ["jpg", "jpeg", "png", "webp"].includes(extRaw) ? extRaw : "jpg";
+
+    const filename = `${kind}_${Date.now()}_${Math.random().toString(16).slice(2)}.${ext}`;
+    const path = `${jobId}/${filename}`;
+
+    const { error } = await supabase.storage.from(BUCKET).upload(path, file, {
+      cacheControl: "3600",
+      upsert: false,
+      contentType: file.type || "image/jpeg",
+    });
+
+    if (error) {
+      alert("Upload Fehler: " + error.message);
+      return;
+    }
+
+    await refreshPhotos();
+  }
+
+  async function deletePhoto(path: string) {
+    if (!ensureAdmin(adminPin)) return;
+
+    const ok = confirm("Foto wirklich löschen?");
+    if (!ok) return;
+
+    const { error } = await supabase.storage.from(BUCKET).remove([path]);
+    if (error) {
+      alert("Löschen fehlgeschlagen: " + error.message);
+      return;
+    }
+    await refreshPhotos();
+  }
 
   async function load() {
     const { data: j } = await supabase.from("jobs").select("*").eq("id", jobId).single();
@@ -117,13 +204,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
     const running = arr.find((x) => x.worker === worker && !x.end_ts);
     setRunningId(running?.id || null);
 
-    const { data: p } = await supabase
-      .from("job_photos")
-      .select("*")
-      .eq("job_id", jobId)
-      .order("created_at", { ascending: false });
-
-    setPhotos(((p || []) as any) as PhotoItem[]);
+    await refreshPhotos();
   }
 
   useEffect(() => {
@@ -150,19 +231,6 @@ export default function JobPage({ params }: { params: { id: string } }) {
 
   async function start() {
     if (done) return setMsg("Auftrag ist abgeschlossen.");
-
-    // Warnung wenn Mitarbeiter noch auf anderem Auftrag läuft
-    const { data: runningOther } = await supabase
-      .from("time_entries")
-      .select("id, job_id")
-      .eq("worker", worker)
-      .is("end_ts", null);
-
-    if (runningOther && runningOther.some((x: any) => x.job_id !== jobId)) {
-      alert(`⚠️ Achtung: ${worker} läuft noch auf einem anderen Auftrag!`);
-      return;
-    }
-
     const existing = entries.find((e) => e.worker === worker && !e.end_ts);
     if (existing) return setMsg("Läuft bereits…");
 
@@ -182,6 +250,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
   async function stop() {
     if (!runningId) return;
     const { error } = await supabase.from("time_entries").update({ end_ts: new Date().toISOString() }).eq("id", runningId);
+
     if (error) return setMsg(error.message);
 
     setRunningId(null);
@@ -189,215 +258,293 @@ export default function JobPage({ params }: { params: { id: string } }) {
     await load();
   }
 
-  async function uploadKmPhoto() {
-    if (!kmFile) return alert("Bitte KM/Fahrzeugausweis Foto auswählen.");
-
-    const path = `jobs/${jobId}/km_${Date.now()}_${kmFile.name}`;
-    const publicUrl = await uploadToBucket(path, kmFile);
-
-    await supabase.from("jobs").update({ km_photo_url: publicUrl }).eq("id", jobId);
-    setKmFile(null);
-    setMsg("✅ KM Foto gespeichert");
-    await load();
-  }
-
-  async function uploadDamagePhoto() {
-    if (!damageFile) return alert("Bitte Foto auswählen.");
-
-    const path = `jobs/${jobId}/damage_${Date.now()}_${damageFile.name}`;
-    const publicUrl = await uploadToBucket(path, damageFile);
-
-    await supabase.from("job_photos").insert({ job_id: jobId, url: publicUrl });
-    setDamageFile(null);
-    setMsg("✅ Foto gespeichert");
-    await load();
-  }
-
-  async function deleteDamagePhoto(p: PhotoItem) {
-    if (!ensureAdmin(ADMIN_PIN)) return;
-
-    if (!confirm("Foto wirklich löschen?")) return;
-
-    // only remove row, file stays in storage (kann man später mit cleanup löschen)
-    await supabase.from("job_photos").delete().eq("id", p.id);
-    setMsg("🗑️ Foto gelöscht");
-    await load();
-  }
-
-  // SIGNATURE
-  function clearSignature() {
-    const c = canvasRef.current;
-    if (!c) return;
-    const ctx = c.getContext("2d");
-    if (!ctx) return;
-    ctx.clearRect(0, 0, c.width, c.height);
-  }
-
-  function canvasToBlob(): Promise<Blob | null> {
-    const c = canvasRef.current;
-    if (!c) return Promise.resolve(null);
-    return new Promise((resolve) => c.toBlob(resolve, "image/png"));
-  }
-
-  async function saveSignature() {
-    if (!sigName.trim()) return alert("Bitte Name eingeben.");
-
-    const blob = await canvasToBlob();
-    if (!blob) return alert("Signatur fehlt.");
-
-    const file = new File([blob], `signature_${jobId}.png`, { type: "image/png" });
-    const path = `jobs/${jobId}/signature_${Date.now()}.png`;
-    const url = await uploadToBucket(path, file);
-
-    await supabase
-      .from("jobs")
-      .update({
-        signature_url: url,
-        signature_name: sigName.trim(),
-        signature_at: new Date().toISOString(),
-      })
-      .eq("id", jobId);
-
-    setMsg("✅ Unterschrift gespeichert");
-    await load();
-  }
-
   async function closeJob() {
-    if (done) return;
+    setMsg("");
 
-    // Pflicht: KM Foto
-    if (!job?.km_photo_url) {
-      alert("❌ Du musst zuerst ein Foto vom Fahrzeugausweis/Kilometer machen.");
-      return;
-    }
+    if (!requiredOk.hasKm) return setMsg("❗ Abschluss nicht möglich: Kilometer Foto fehlt (KM Foto speichern).");
+    if (!requiredOk.hasAusweis) return setMsg("❗ Abschluss nicht möglich: Fahrzeugausweis Foto fehlt (Ausweis Foto speichern).");
 
     const now = new Date().toISOString();
 
-    // stop all running entries
     await supabase.from("time_entries").update({ end_ts: now }).eq("job_id", jobId).is("end_ts", null);
-
     await supabase.from("jobs").update({ status: "done", closed_at: now }).eq("id", jobId);
 
     setMsg("✅ Auftrag abgeschlossen");
     await load();
   }
 
-  async function reopenJob() {
-    if (!ensureAdmin(ADMIN_PIN)) return;
+  async function reopenJobChef() {
+    if (!ensureAdmin(adminPin)) return;
+    if (!job) return;
 
-    if (!confirm("Auftrag wieder entsperren?")) return;
+    const ok = confirm("Auftrag wirklich wieder öffnen?");
+    if (!ok) return;
 
     await supabase.from("jobs").update({ status: "open", closed_at: null }).eq("id", jobId);
     setMsg("🔓 Auftrag wieder geöffnet");
     await load();
   }
 
-  async function exportPdf() {
-    if (!ensureAdmin(ADMIN_PIN)) return;
+  function exportCsv() {
     if (!job) return;
 
-    const doc = new jsPDF();
-
-    doc.setFontSize(16);
-    doc.text("Pro Automobile - Rapport", 14, 18);
-
-    doc.setFontSize(11);
-    doc.text(`Auftrag: ${job.title}`, 14, 28);
-    doc.text(`Kunde: ${job.customer || "-"}`, 14, 35);
-    doc.text(`Fahrzeug: ${job.vehicle || "-"}`, 14, 42);
-    doc.text(`Kontrollschild: ${job.plate || "-"}`, 14, 49);
-    doc.text(`Status: ${job.status || "open"}`, 14, 56);
-
-    doc.text(`Total: ${fmtMin(totals.total)}`, 14, 66);
+    const header = ["job_title", "customer", "vehicle", "plate", "job_status", "worker", "task", "start", "end", "duration_min"].join(",");
 
     const rows = entries
       .slice()
       .reverse()
-      .map((e) => [
-        e.worker,
-        e.task || "",
-        toLocal(e.start_ts),
-        e.end_ts ? toLocal(e.end_ts) : "läuft…",
-        fmtMin(durationMinutes(e.start_ts, e.end_ts)),
-      ]);
+      .map((e) => {
+        const dur = durationMinutes(e.start_ts, e.end_ts);
+        const cols = [
+          job.title,
+          job.customer || "",
+          job.vehicle || "",
+          job.plate || "",
+          job.status || "open",
+          e.worker,
+          e.task || "",
+          e.start_ts,
+          e.end_ts || "",
+          String(dur),
+        ].map((x) => JSON.stringify(x));
+        return cols.join(",");
+      });
 
-    autoTable(doc, {
-      startY: 74,
-      head: [["Mitarbeiter", "Tätigkeit", "Start", "Ende", "Dauer"]],
-      body: rows,
-    });
+    const csv = [header, ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
 
-    let y = (doc as any).lastAutoTable?.finalY ? (doc as any).lastAutoTable.finalY + 8 : 140;
-
-    if (job.signature_name) {
-      doc.text(`Unterschrift: ${job.signature_name}`, 14, y);
-      y += 8;
-      doc.text(`Zeit: ${toLocal(job.signature_at)}`, 14, y);
-      y += 8;
-    }
-
-    doc.save(`rapport_${(job.plate || "ohne-kennzeichen").replace(/\s+/g, "_")}_${jobId}.pdf`);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `rapport_${(job.plate || "ohne-kennzeichen").replace(/\s+/g, "_")}_${jobId}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
   }
 
-  // draw signature
+  async function exportPdfChef() {
+    if (!ensureAdmin(adminPin)) return;
+    if (!job) return;
+
+    try {
+      setBusyPdf(true);
+
+      const { jsPDF } = await import("jspdf");
+      const doc = new jsPDF({ unit: "pt", format: "a4" });
+
+      const margin = 40;
+      let y = 46;
+
+      doc.setFontSize(16);
+      doc.text("Pro Automobile – Rapport", margin, y);
+      y += 18;
+
+      doc.setFontSize(10);
+      doc.text(`Auftrag: ${job.title}`, margin, y); y += 14;
+      doc.text(`Kunde: ${job.customer || "-"}`, margin, y); y += 14;
+      doc.text(`Fahrzeug: ${job.vehicle || "-"}`, margin, y); y += 14;
+      doc.text(`Kontrollschild: ${job.plate || "-"}`, margin, y); y += 14;
+      doc.text(`Status: ${job.status || "open"}`, margin, y); y += 14;
+      doc.text(`Erstellt: ${toLocal(job.created_at || null)}`, margin, y); y += 14;
+      doc.text(`Abgeschlossen: ${toLocal(job.closed_at || null)}`, margin, y); y += 18;
+
+      doc.setFontSize(11);
+      doc.text(`Total: ${fmtMin(totals.total)}`, margin, y);
+      y += 18;
+
+      doc.setFontSize(10);
+      doc.text("Mitarbeiter | Tätigkeit | Start | Ende | Dauer", margin, y);
+      y += 12;
+
+      const lines = entries
+        .slice()
+        .reverse()
+        .map((e) => {
+          const dur = durationMinutes(e.start_ts, e.end_ts);
+          return `${e.worker} | ${e.task || "-"} | ${toLocal(e.start_ts)} | ${e.end_ts ? toLocal(e.end_ts) : "läuft…"} | ${fmtMin(dur)}`;
+        });
+
+      for (const line of lines) {
+        const chunks = doc.splitTextToSize(line, 515);
+        doc.text(chunks, margin, y);
+        y += chunks.length * 12;
+        if (y > 700) { doc.addPage(); y = 40; }
+      }
+
+      async function addImageBlock(title: string, url?: string) {
+        if (!url) return;
+        if (y > 620) { doc.addPage(); y = 40; }
+        doc.setFontSize(12);
+        doc.text(title, margin, y);
+        y += 10;
+
+        const dataUrl = await fetchAsDataUrl(url);
+        doc.addImage(dataUrl, "JPEG", margin, y + 6, 515, 240);
+        y += 260;
+      }
+
+      await addImageBlock("Kilometerstand Foto", kmPhoto?.url);
+      await addImageBlock("Fahrzeugausweis Foto", ausweisPhoto?.url);
+
+      // Unterschrift: falls signature_url eine URL ist -> nutzen, sonst storage-path -> signed url erzeugen
+      let sigUrl: string | null = null;
+      if (job.signature_url) {
+        if (job.signature_url.startsWith("http")) {
+          sigUrl = job.signature_url;
+        } else if (job.signature_url.includes("/")) {
+          const { data: signed } = await supabase.storage.from(BUCKET).createSignedUrl(job.signature_url, 60 * 60 * 24 * 7);
+          sigUrl = signed?.signedUrl || null;
+        }
+      }
+
+      if (sigUrl) {
+        if (y > 640) { doc.addPage(); y = 40; }
+        doc.setFontSize(12);
+        doc.text("Unterschrift", margin, y);
+        y += 10;
+
+        const sigDataUrl = await fetchAsDataUrl(sigUrl);
+        doc.addImage(sigDataUrl, "PNG", margin, y + 6, 260, 120);
+        y += 140;
+
+        doc.setFontSize(10);
+        doc.text(`Name: ${job.signature_name || "-"}`, margin, y); y += 14;
+        doc.text(`Zeit: ${toLocal(job.signature_at || null)}`, margin, y); y += 14;
+      }
+
+      doc.save(`rapport_${(job.plate || "ohne-kennzeichen").replace(/\s+/g, "_")}_${jobId}.pdf`);
+    } catch (e: any) {
+      alert("PDF Fehler: " + (e?.message || String(e)));
+    } finally {
+      setBusyPdf(false);
+    }
+  }
+
+  async function saveSignature() {
+    if (!job) return;
+    if (!ensureAdmin(adminPin)) return;
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const dataUrl = canvas.toDataURL("image/png");
+    if (!dataUrl || dataUrl.length < 100) return alert("Unterschrift fehlt.");
+
+    setSignBusy(true);
+    try {
+      const blob = await (await fetch(dataUrl)).blob();
+
+      const filename = `signature_${Date.now()}.png`;
+      const storagePath = `${jobId}/${filename}`; // wir speichern PATH, nicht signed URL (damit PDF immer geht)
+
+      const { error } = await supabase.storage.from(BUCKET).upload(storagePath, blob, {
+        cacheControl: "3600",
+        upsert: true,
+        contentType: "image/png",
+      });
+      if (error) throw new Error(error.message);
+
+      const now = new Date().toISOString();
+      const { error: upErr } = await supabase
+        .from("jobs")
+        .update({
+          signature_url: storagePath, // <- PATH speichern!
+          signature_name: (signName || "").trim() || null,
+          signature_at: now,
+        })
+        .eq("id", jobId);
+
+      if (upErr) throw new Error(upErr.message);
+
+      alert("✅ Unterschrift gespeichert");
+      await load();
+    } catch (e: any) {
+      alert("Unterschrift Fehler: " + (e?.message || String(e)));
+    } finally {
+      setSignBusy(false);
+    }
+  }
+
+  // Canvas Draw
   useEffect(() => {
-    const c = canvasRef.current;
-    if (!c) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
-    c.width = 800;
-    c.height = 220;
-
-    const ctx = c.getContext("2d");
+    const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
     ctx.lineWidth = 3;
     ctx.lineCap = "round";
+    ctx.strokeStyle = "#ffffff";
 
     let drawing = false;
 
     const getPos = (e: any) => {
-      const r = c.getBoundingClientRect();
-      const x = (e.touches ? e.touches[0].clientX : e.clientX) - r.left;
-      const y = (e.touches ? e.touches[0].clientY : e.clientY) - r.top;
-      return { x, y };
+      const rect = canvas.getBoundingClientRect();
+      const clientX = e.touches?.[0]?.clientX ?? e.clientX;
+      const clientY = e.touches?.[0]?.clientY ?? e.clientY;
+      return { x: clientX - rect.left, y: clientY - rect.top };
     };
 
-    const startDraw = (e: any) => {
+    const down = (e: any) => {
       drawing = true;
       const p = getPos(e);
       ctx.beginPath();
       ctx.moveTo(p.x, p.y);
     };
-
-    const moveDraw = (e: any) => {
+    const move = (e: any) => {
       if (!drawing) return;
-      e.preventDefault();
       const p = getPos(e);
       ctx.lineTo(p.x, p.y);
       ctx.stroke();
     };
-
-    const endDraw = () => {
+    const up = () => {
       drawing = false;
     };
 
-    c.addEventListener("mousedown", startDraw);
-    c.addEventListener("mousemove", moveDraw);
-    window.addEventListener("mouseup", endDraw);
+    canvas.addEventListener("mousedown", down);
+    canvas.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
 
-    c.addEventListener("touchstart", startDraw, { passive: false });
-    c.addEventListener("touchmove", moveDraw, { passive: false });
-    window.addEventListener("touchend", endDraw);
+    canvas.addEventListener("touchstart", down, { passive: true } as any);
+    canvas.addEventListener("touchmove", move, { passive: true } as any);
+    window.addEventListener("touchend", up);
 
     return () => {
-      c.removeEventListener("mousedown", startDraw);
-      c.removeEventListener("mousemove", moveDraw);
-      window.removeEventListener("mouseup", endDraw);
-      c.removeEventListener("touchstart", startDraw);
-      c.removeEventListener("touchmove", moveDraw);
-      window.removeEventListener("touchend", endDraw);
+      canvas.removeEventListener("mousedown", down);
+      canvas.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+
+      canvas.removeEventListener("touchstart", down as any);
+      canvas.removeEventListener("touchmove", move as any);
+      window.removeEventListener("touchend", up);
     };
   }, []);
+
+  // Unterschrift Preview URL (wenn signature_url PATH ist)
+  const signaturePreviewUrl = useMemo(() => {
+    const s = job?.signature_url || "";
+    if (!s) return "";
+    if (s.startsWith("http")) return s;
+    // wird später in UI per Signed URL geladen (einfacher: wir nutzen ein img mit signed url via effect)
+    return "";
+  }, [job?.signature_url]);
+
+  const [signatureSignedUrl, setSignatureSignedUrl] = useState<string>("");
+
+  useEffect(() => {
+    (async () => {
+      const s = job?.signature_url || "";
+      if (!s) return setSignatureSignedUrl("");
+      if (s.startsWith("http")) return setSignatureSignedUrl(s);
+
+      if (s.includes("/")) {
+        const { data: signed } = await supabase.storage.from(BUCKET).createSignedUrl(s, 60 * 60 * 24 * 7);
+        setSignatureSignedUrl(signed?.signedUrl || "");
+      } else {
+        setSignatureSignedUrl("");
+      }
+    })();
+  }, [job?.signature_url]);
 
   return (
     <div>
@@ -411,13 +558,18 @@ export default function JobPage({ params }: { params: { id: string } }) {
             </div>
             <div>
               <div className="h1">{job?.title || "Auftrag"}</div>
-              <div className="muted">
-                {[job?.customer, job?.vehicle, job?.plate].filter(Boolean).join(" · ")}
+              <div className="muted">{[job?.customer, job?.vehicle, job?.plate].filter(Boolean).join(" · ")}</div>
+              <div className="muted" style={{ fontSize: 12 }}>
+                {done ? `✅ Abgeschlossen: ${toLocal(job?.closed_at || null)}` : `🟠 Offen (erstellt: ${toLocal(job?.created_at || null)})`}
               </div>
             </div>
           </div>
-          <div>
-            {done ? <span className="pill pillDone">Abgeschlossen</span> : <span className="pill pillOpen">Offen</span>}
+
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <span className="pill">
+              <span className="dot" style={{ background: requiredOk.ok ? "#30d158" : "#ff453a" }} />
+              Pflicht-Fotos: {requiredOk.ok ? "OK" : "fehlt"}
+            </span>
           </div>
         </div>
       </div>
@@ -432,6 +584,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
         </div>
       </div>
 
+      {/* Start/Stop */}
       <div className="card">
         <div className="row">
           <div className="h2">Start / Stop</div>
@@ -454,81 +607,134 @@ export default function JobPage({ params }: { params: { id: string } }) {
         </div>
 
         <div className="grid2" style={{ marginTop: 10 }}>
-          <button className="btn btnDanger" onClick={closeJob} disabled={done}>Auftrag abschliessen ✅</button>
-          <button className="btn" onClick={reopenJob} disabled={!done}>🔓 Wieder öffnen (Chef)</button>
+          <button className="btn btnDanger" onClick={closeJob} disabled={done}>
+            Auftrag abschliessen ✅
+          </button>
+          <button className="btn" onClick={exportCsv}>CSV Rapport</button>
         </div>
 
-        <div style={{ marginTop: 10 }}>
-          <button className="btn btnPrimary" onClick={exportPdf}>
-            📄 Rapport als PDF (Chef)
+        <div className="grid2" style={{ marginTop: 10 }}>
+          <button className="btn" onClick={exportPdfChef} disabled={busyPdf}>
+            {busyPdf ? "PDF…" : "Rapport als PDF (Chef)"}
+          </button>
+          <button className="btn" onClick={reopenJobChef}>
+            🔓 Wieder öffnen (Chef)
           </button>
         </div>
       </div>
 
-      {/* KM Foto Pflicht */}
+      {/* Pflicht-Fotos (Variante B: wählen -> speichern) */}
       <div className="card">
         <div className="h2">Fahrzeugausweis / Kilometer (Pflicht)</div>
-        <div className="muted">Ohne dieses Foto kann der Auftrag nicht abgeschlossen werden.</div>
-
-        {job?.km_photo_url ? (
-          <div style={{ marginTop: 10 }}>
-            <img src={job.km_photo_url} style={{ width: "100%", borderRadius: 14 }} />
-          </div>
-        ) : (
-          <div className="muted" style={{ marginTop: 10 }}>Noch kein Foto vorhanden.</div>
-        )}
-
-        <div style={{ marginTop: 10 }}>
-          <input type="file" accept="image/*" capture="environment" onChange={(e) => setKmFile(e.target.files?.[0] || null)} />
-          <button className="btn btnPrimary" style={{ marginTop: 8 }} onClick={uploadKmPhoto}>📸 KM Foto speichern</button>
-        </div>
-      </div>
-
-      {/* Schäden */}
-      <div className="card">
-        <div className="h2">Schadenfotos</div>
-
-        <div style={{ marginTop: 10 }}>
-          <input type="file" accept="image/*" capture="environment" onChange={(e) => setDamageFile(e.target.files?.[0] || null)} />
-          <button className="btn btnPrimary" style={{ marginTop: 8 }} onClick={uploadDamagePhoto}>📸 Foto speichern</button>
+        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+          Ohne diese Fotos kann der Auftrag nicht abgeschlossen werden.
         </div>
 
-        <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
-          {photos.map((p) => (
-            <div key={p.id} className="card" style={{ padding: 10 }}>
-              <img src={p.url} style={{ width: "100%", borderRadius: 14 }} />
-              <div className="muted" style={{ marginTop: 6, fontSize: 12 }}>{toLocal(p.created_at)}</div>
-              <button className="btn btnDanger" style={{ marginTop: 8 }} onClick={() => deleteDamagePhoto(p)}>
-                🗑️ Foto löschen (Chef)
+        <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          {/* KM */}
+          <div style={{ border: "1px solid rgba(255,255,255,0.10)", borderRadius: 16, padding: 12 }}>
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>Kilometer (Pflicht)</div>
+
+            {kmPhoto ? (
+              <div>
+                <img src={kmPhoto.url} alt="KM" style={{ width: "100%", height: 170, objectFit: "cover", borderRadius: 12 }} />
+                <div className="muted" style={{ fontSize: 11, marginTop: 8, wordBreak: "break-all" }}>{kmPhoto.name}</div>
+                <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+                  <button className="btn" onClick={() => window.open(kmPhoto.url, "_blank")}>Öffnen</button>
+                  <button className="btn btnDanger" onClick={() => deletePhoto(kmPhoto.path)}>Löschen (Chef)</button>
+                </div>
+              </div>
+            ) : (
+              <div className="muted" style={{ marginTop: 8 }}>Noch kein Foto vorhanden.</div>
+            )}
+
+            <div style={{ marginTop: 12 }}>
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                onChange={(e) => {
+                  const f = e.target.files?.[0] || null;
+                  setKmFile(f);
+                }}
+              />
+              <button
+                className="btn btnPrimary"
+                style={{ marginTop: 10, width: "100%" }}
+                disabled={!kmFile || busyUploadKm}
+                onClick={async () => {
+                  if (!kmFile) return;
+                  setBusyUploadKm(true);
+                  try {
+                    await uploadPhoto(kmFile, "km");
+                    setKmFile(null);
+                  } finally {
+                    setBusyUploadKm(false);
+                  }
+                }}
+              >
+                📷 {busyUploadKm ? "Speichern…" : "KM Foto speichern"}
               </button>
             </div>
-          ))}
+          </div>
+
+          {/* Ausweis */}
+          <div style={{ border: "1px solid rgba(255,255,255,0.10)", borderRadius: 16, padding: 12 }}>
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>Fahrzeugausweis (Pflicht)</div>
+
+            {ausweisPhoto ? (
+              <div>
+                <img src={ausweisPhoto.url} alt="Ausweis" style={{ width: "100%", height: 170, objectFit: "cover", borderRadius: 12 }} />
+                <div className="muted" style={{ fontSize: 11, marginTop: 8, wordBreak: "break-all" }}>{ausweisPhoto.name}</div>
+                <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+                  <button className="btn" onClick={() => window.open(ausweisPhoto.url, "_blank")}>Öffnen</button>
+                  <button className="btn btnDanger" onClick={() => deletePhoto(ausweisPhoto.path)}>Löschen (Chef)</button>
+                </div>
+              </div>
+            ) : (
+              <div className="muted" style={{ marginTop: 8 }}>Noch kein Foto vorhanden.</div>
+            )}
+
+            <div style={{ marginTop: 12 }}>
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                onChange={(e) => {
+                  const f = e.target.files?.[0] || null;
+                  setAusweisFile(f);
+                }}
+              />
+              <button
+                className="btn btnPrimary"
+                style={{ marginTop: 10, width: "100%" }}
+                disabled={!ausweisFile || busyUploadAusweis}
+                onClick={async () => {
+                  if (!ausweisFile) return;
+                  setBusyUploadAusweis(true);
+                  try {
+                    await uploadPhoto(ausweisFile, "ausweis");
+                    setAusweisFile(null);
+                  } finally {
+                    setBusyUploadAusweis(false);
+                  }
+                }}
+              >
+                🪪 {busyUploadAusweis ? "Speichern…" : "Ausweis Foto speichern"}
+              </button>
+            </div>
+          </div>
         </div>
-      </div>
 
-      {/* Unterschrift */}
-      <div className="card">
-        <div className="h2">Unterschrift</div>
-        <div className="muted">Wird in PDF übernommen.</div>
-
-        {job?.signature_url ? (
-          <div style={{ marginTop: 10 }}>
-            <div className="muted">Vorhanden: {job.signature_name} ({toLocal(job.signature_at)})</div>
-            <img src={job.signature_url} style={{ width: "100%", borderRadius: 14, marginTop: 6 }} />
-          </div>
-        ) : null}
-
-        <div style={{ marginTop: 10 }}>
-          <input className="select" placeholder="Name (z.B. Kunde)" value={sigName} onChange={(e) => setSigName(e.target.value)} />
-
-          <div style={{ marginTop: 8, borderRadius: 16, overflow: "hidden", border: "1px solid rgba(255,255,255,0.12)" }}>
-            <canvas ref={canvasRef} style={{ width: "100%", background: "#fff" }} />
-          </div>
-
-          <div className="grid2" style={{ marginTop: 8 }}>
-            <button className="btn btnDark" onClick={clearSignature}>✏️ Neu</button>
-            <button className="btn btnPrimary" onClick={saveSignature}>✅ Speichern</button>
-          </div>
+        <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <span className="pill">
+            <span className="dot" style={{ background: requiredOk.hasAusweis ? "#30d158" : "#ff453a" }} />
+            Ausweis: {requiredOk.hasAusweis ? "OK" : "fehlt"}
+          </span>
+          <span className="pill">
+            <span className="dot" style={{ background: requiredOk.hasKm ? "#30d158" : "#ff453a" }} />
+            KM: {requiredOk.hasKm ? "OK" : "fehlt"}
+          </span>
         </div>
       </div>
 
@@ -565,6 +771,125 @@ export default function JobPage({ params }: { params: { id: string } }) {
             </tbody>
           </table>
         </div>
+      </div>
+
+      {/* Schadenfotos + Löschen fix */}
+      <div className="card">
+        <div className="row">
+          <div>
+            <div className="h2">Schadenfotos</div>
+            <div className="muted" style={{ fontSize: 12 }}>Löschen ist Chef-geschützt.</div>
+          </div>
+
+          <label className="btn btnPrimary" style={{ cursor: "pointer" }}>
+            Schaden-Foto hinzufügen
+            <input
+              type="file"
+              accept="image/*"
+              capture="environment"
+              style={{ display: "none" }}
+              onChange={async (e) => {
+                const file = e.target.files?.[0];
+                e.target.value = "";
+                if (!file) return;
+                setBusyUploadDamage(true);
+                try {
+                  await uploadPhoto(file, "schaden");
+                } finally {
+                  setBusyUploadDamage(false);
+                }
+              }}
+            />
+          </label>
+        </div>
+
+        {busyUploadDamage && <div className="muted" style={{ marginTop: 10 }}>Upload läuft…</div>}
+
+        {damagePhotos.length === 0 ? (
+          <div className="muted" style={{ marginTop: 10 }}>Noch keine Schadenfotos.</div>
+        ) : (
+          <div
+            style={{
+              marginTop: 12,
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))",
+              gap: 12,
+            }}
+          >
+            {damagePhotos.map((p) => (
+              <div
+                key={p.path}
+                style={{
+                  borderRadius: 16,
+                  overflow: "hidden",
+                  border: "1px solid rgba(255,255,255,0.08)",
+                }}
+              >
+                <a href={p.url} target="_blank" rel="noreferrer">
+                  <img
+                    src={p.url}
+                    alt="Foto"
+                    style={{ width: "100%", height: 130, objectFit: "cover", display: "block" }}
+                  />
+                </a>
+
+                <div style={{ padding: 8 }}>
+                  <div className="muted" style={{ fontSize: 11, wordBreak: "break-all" }}>
+                    {p.name}
+                  </div>
+                  <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                    <button className="btn" onClick={() => window.open(p.url, "_blank")}>Öffnen</button>
+                    <button className="btn btnDanger" onClick={() => deletePhoto(p.path)}>Löschen</button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Unterschrift (Chef) */}
+      <div className="card">
+        <div className="h2">Unterschrift (Chef)</div>
+        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+          Wird im PDF übernommen, sobald gespeichert.
+        </div>
+
+        <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <input
+            className="input"
+            value={signName}
+            onChange={(e) => setSignName(e.target.value)}
+            placeholder="Name (optional)"
+            style={{ minWidth: 220 }}
+          />
+          <button
+            className="btn"
+            onClick={() => {
+              const c = canvasRef.current;
+              if (!c) return;
+              const ctx = c.getContext("2d");
+              if (!ctx) return;
+              ctx.clearRect(0, 0, c.width, c.height);
+            }}
+          >
+            Löschen
+          </button>
+          <button className="btn btnPrimary" onClick={saveSignature} disabled={signBusy}>
+            {signBusy ? "Speichert…" : "Unterschrift speichern"}
+          </button>
+        </div>
+
+        <div style={{ marginTop: 12, borderRadius: 16, overflow: "hidden", border: "1px solid rgba(255,255,255,0.12)" }}>
+          <canvas ref={canvasRef} width={700} height={220} style={{ width: "100%", height: 180, background: "rgba(255,255,255,0.03)" }} />
+        </div>
+
+        {(signatureSignedUrl || signaturePreviewUrl) && (
+          <div style={{ marginTop: 12 }}>
+            <div className="muted" style={{ fontSize: 12 }}>Gespeicherte Unterschrift:</div>
+            <img src={signatureSignedUrl || signaturePreviewUrl} alt="Unterschrift" style={{ marginTop: 6, width: 260, borderRadius: 12 }} />
+          </div>
+        )}
       </div>
     </div>
   );
