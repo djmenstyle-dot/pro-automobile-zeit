@@ -87,9 +87,7 @@ async function signedUrl(bucket: string, path: string, seconds: number) {
 
 export default function JobPage({ params }: { params: { id: string } }) {
   const jobId = params.id;
-
-  // Chef PIN (Frontend Check für "Chef-Modus")
-  const adminPinEnv = process.env.NEXT_PUBLIC_ADMIN_PIN || "";
+  const adminPin = process.env.NEXT_PUBLIC_ADMIN_PIN || "";
 
   const [job, setJob] = useState<Job | null>(null);
   const [entries, setEntries] = useState<Entry[]>([]);
