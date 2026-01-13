@@ -184,7 +184,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
     const ok = confirm("Foto wirklich löschen?");
     if (!ok) return;
 
-    const pin = promptAdminPin();
+    const pin = promptAdminPin(adminPin);
     if (!pin) return;
 
     const res = await fetch("/api/storage/delete", {
