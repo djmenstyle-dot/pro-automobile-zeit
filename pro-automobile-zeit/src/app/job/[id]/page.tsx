@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { supabase } from "./lib/supabaseClient";
-import { ensureAdmin, isAdmin, logoutAdmin } from "./lib/admin";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { supabase } from "../../lib/supabaseClient";
+import { ensureAdmin } from "../../lib/admin";
 
 type Job = {
   id: string;
@@ -13,14 +13,25 @@ type Job = {
   status: string | null;
   created_at?: string | null;
   closed_at?: string | null;
+
+  signature_url?: string | null;
+  signature_name?: string | null;
+  signature_at?: string | null;
 };
 
-const BUCKET = "job-photos";
+type Entry = {
+  id: string;
+  job_id: string;
+  worker: string;
+  task: string | null;
+  start_ts: string;
+  end_ts: string | null;
+};
 
-function badge(status: string | null) {
-  const s = status || "open";
-  return s === "done" ? "Abgeschlossen" : "Offen";
-}
+const WORKERS = ["Esteban", "Eron", "Jeremie", "Tsvetan", "Mensel"];
+const TASKS = ["Service", "Diagnose", "Bremsen", "Reifen", "MFK", "Elektrik", "Klima", "Probefahrt", "Sonstiges"];
+
+const BUCKET = "job-photos";
 
 function toLocal(iso?: string | null) {
   if (!iso) return "";
@@ -28,290 +39,728 @@ function toLocal(iso?: string | null) {
   return d.toLocaleString("de-CH");
 }
 
-async function uploadRequiredPhoto(jobId: string, file: File, kind: "ausweis" | "km") {
-  const ext = (file.name.split(".").pop() || "jpg").toLowerCase();
-  const safeExt = ["jpg", "jpeg", "png", "webp"].includes(ext) ? ext : "jpg";
-  const filename = `${kind}_${Date.now()}_${Math.random().toString(16).slice(2)}.${safeExt}`;
-  const path = `${jobId}/${filename}`;
-
-  const { error } = await supabase.storage.from(BUCKET).upload(path, file, {
-    cacheControl: "3600",
-    upsert: false,
-    contentType: file.type || "image/jpeg",
-  });
-
-  if (error) throw new Error(error.message);
+function durationMinutes(start: string, end?: string | null) {
+  const s = new Date(start).getTime();
+  const e = end ? new Date(end).getTime() : Date.now();
+  return Math.max(0, Math.round((e - s) / 60000));
 }
 
-export default function HomePage() {
+function fmtMin(min: number) {
+  if (min < 60) return `${min}min`;
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return `${h}h ${m}min`;
+}
+
+async function fetchAsDataUrl(url: string): Promise<string> {
+  const res = await fetch(url);
+  const blob = await res.blob();
+  return await new Promise<string>((resolve) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result));
+    r.readAsDataURL(blob);
+  });
+}
+
+export default function JobPage({ params }: { params: { id: string } }) {
+  const jobId = params.id;
   const adminPin = process.env.NEXT_PUBLIC_ADMIN_PIN || "";
 
-  const [title, setTitle] = useState("Pro Automobile ersatzwagen");
-  const [customer, setCustomer] = useState("");
-  const [vehicle, setVehicle] = useState("");
-  const [plate, setPlate] = useState("");
-  const [msg, setMsg] = useState("");
+  const [job, setJob] = useState<Job | null>(null);
+  const [entries, setEntries] = useState<Entry[]>([]);
+  const [worker, setWorker] = useState(WORKERS[0]);
+  const [task, setTask] = useState(TASKS[0]);
+  const [runningId, setRunningId] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string>("");
 
-  // Pflicht-Fotos
-  const [ausweisFile, setAusweisFile] = useState<File | null>(null);
-  const [kmFile, setKmFile] = useState<File | null>(null);
+  // Fotos
+  const [photos, setPhotos] = useState<{ path: string; name: string; url: string }[]>([]);
+  const [busyPdf, setBusyPdf] = useState(false);
 
-  const [jobsOpen, setJobsOpen] = useState<Job[]>([]);
-  const [jobsDone, setJobsDone] = useState<Job[]>([]);
+  // Unterschrift Canvas (falls du schon eins hattest, bleibt das hier kompatibel)
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [signName, setSignName] = useState("");
+  const [signBusy, setSignBusy] = useState(false);
 
-  const [q, setQ] = useState(""); // Suche über offen+done
-  const [loading, setLoading] = useState(false);
+  const done = (job?.status || "open") === "done";
 
-  const canCreate = useMemo(() => {
-    const plateOk = plate.trim().length > 0;
-    const ausweisOk = !!ausweisFile;
-    const kmOk = !!kmFile;
-    return plateOk && ausweisOk && kmOk;
-  }, [plate, ausweisFile, kmFile]);
+  const jobLink = useMemo(() => (typeof window !== "undefined" ? window.location.href : ""), []);
+  const qrUrl = useMemo(
+    () => `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(jobLink)}`,
+    [jobLink]
+  );
+
+  const requiredOk = useMemo(() => {
+    const hasAusweis = photos.some((p) => p.name.toLowerCase().startsWith("ausweis_"));
+    const hasKm = photos.some((p) => p.name.toLowerCase().startsWith("km_"));
+    return { hasAusweis, hasKm, ok: hasAusweis && hasKm };
+  }, [photos]);
+
+  async function refreshPhotos() {
+    const { data, error } = await supabase.storage.from(BUCKET).list(jobId, {
+      limit: 200,
+      sortBy: { column: "created_at", order: "desc" },
+    });
+
+    if (error) {
+      console.warn("photo list error:", error.message);
+      setPhotos([]);
+      return;
+    }
+
+    const items = (data || []).filter((x) => x.name && x.name !== ".emptyFolderPlaceholder");
+    const out: { path: string; name: string; url: string }[] = [];
+
+    for (const it of items) {
+      const path = `${jobId}/${it.name}`;
+      const { data: signed } = await supabase.storage.from(BUCKET).createSignedUrl(path, 60 * 60 * 24 * 7);
+      if (signed?.signedUrl) out.push({ path, name: it.name, url: signed.signedUrl });
+    }
+
+    setPhotos(out);
+  }
+
+  async function uploadPhoto(file: File, kind?: "ausweis" | "km" | "schaden") {
+    const ext = (file.name.split(".").pop() || "jpg").toLowerCase();
+    const safeExt = ["jpg", "jpeg", "png", "webp"].includes(ext) ? ext : "jpg";
+    const prefix = kind ? `${kind}_` : "schaden_";
+    const filename = `${prefix}${Date.now()}_${Math.random().toString(16).slice(2)}.${safeExt}`;
+    const path = `${jobId}/${filename}`;
+
+    const { error } = await supabase.storage.from(BUCKET).upload(path, file, {
+      cacheControl: "3600",
+      upsert: false,
+      contentType: file.type || "image/jpeg",
+    });
+
+    if (error) {
+      alert("Upload Fehler: " + error.message);
+      return;
+    }
+
+    await refreshPhotos();
+  }
+
+  async function deletePhoto(path: string) {
+    // Chef-only
+    if (!ensureAdmin(adminPin)) return;
+
+    const ok = confirm("Foto wirklich löschen?");
+    if (!ok) return;
+
+    const { error } = await supabase.storage.from(BUCKET).remove([path]);
+    if (error) {
+      alert("Löschen fehlgeschlagen: " + error.message);
+      return;
+    }
+    await refreshPhotos();
+  }
 
   async function load() {
-    // Offen (neueste oben)
-    const { data: openData } = await supabase
-      .from("jobs")
-      .select("*")
-      .eq("status", "open")
-      .order("created_at", { ascending: false })
-      .limit(50);
+    const { data: j } = await supabase.from("jobs").select("*").eq("id", jobId).single();
+    setJob((j as any) || null);
 
-    // Done (nach closed_at, fallback created_at)
-    const { data: doneData } = await supabase
-      .from("jobs")
+    const { data: e } = await supabase
+      .from("time_entries")
       .select("*")
-      .eq("status", "done")
-      .order("closed_at", { ascending: false, nullsFirst: false })
-      .order("created_at", { ascending: false })
-      .limit(50);
+      .eq("job_id", jobId)
+      .order("start_ts", { ascending: false });
 
-    setJobsOpen((openData || []) as any);
-    setJobsDone((doneData || []) as any);
+    const arr = ((e || []) as any) as Entry[];
+    setEntries(arr);
+
+    const running = arr.find((x) => x.worker === worker && !x.end_ts);
+    setRunningId(running?.id || null);
+
+    await refreshPhotos();
   }
 
   useEffect(() => {
     load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const filteredOpen = useMemo(() => {
-    const s = q.trim().toLowerCase();
-    if (!s) return jobsOpen;
-    return jobsOpen.filter((j) =>
-      [j.title, j.customer, j.vehicle, j.plate].filter(Boolean).join(" ").toLowerCase().includes(s)
-    );
-  }, [q, jobsOpen]);
+  useEffect(() => {
+    const running = entries.find((x) => x.worker === worker && !x.end_ts);
+    setRunningId(running?.id || null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [worker]);
 
-  const filteredDone = useMemo(() => {
-    const s = q.trim().toLowerCase();
-    if (!s) return jobsDone;
-    return jobsDone.filter((j) =>
-      [j.title, j.customer, j.vehicle, j.plate].filter(Boolean).join(" ").toLowerCase().includes(s)
-    );
-  }, [q, jobsDone]);
+  const totals = useMemo(() => {
+    let total = 0;
+    const perWorker: Record<string, number> = {};
+    for (const e of entries) {
+      const min = durationMinutes(e.start_ts, e.end_ts);
+      total += min;
+      perWorker[e.worker] = (perWorker[e.worker] || 0) + min;
+    }
+    return { total, perWorker };
+  }, [entries]);
 
-  async function createJob() {
+  async function start() {
+    if (done) return setMsg("Auftrag ist abgeschlossen.");
+    const existing = entries.find((e) => e.worker === worker && !e.end_ts);
+    if (existing) return setMsg("Läuft bereits…");
+
+    const { data, error } = await supabase
+      .from("time_entries")
+      .insert({ job_id: jobId, worker, task })
+      .select("id")
+      .single();
+
+    if (error) return setMsg(error.message);
+
+    setRunningId(data.id);
+    setMsg("✅ läuft…");
+    await load();
+  }
+
+  async function stop() {
+    if (!runningId) return;
+    const { error } = await supabase
+      .from("time_entries")
+      .update({ end_ts: new Date().toISOString() })
+      .eq("id", runningId);
+
+    if (error) return setMsg(error.message);
+
+    setRunningId(null);
+    setMsg("🛑 gestoppt");
+    await load();
+  }
+
+  async function closeJob() {
     setMsg("");
-    if (!plate.trim()) return setMsg("Kontrollschild ist Pflicht.");
-    if (!ausweisFile) return setMsg("Fahrzeugausweis Foto ist Pflicht.");
-    if (!kmFile) return setMsg("Kilometer Foto ist Pflicht.");
+
+    // Pflicht-Check: KM + Ausweis Foto müssen da sein
+    if (!requiredOk.hasKm) return setMsg("❗ Abschluss nicht möglich: Kilometer Foto fehlt.");
+    if (!requiredOk.hasAusweis) return setMsg("❗ Abschluss nicht möglich: Fahrzeugausweis Foto fehlt.");
+
+    const now = new Date().toISOString();
+
+    // stoppe alles was läuft
+    await supabase.from("time_entries").update({ end_ts: now }).eq("job_id", jobId).is("end_ts", null);
+
+    // setze status + closed_at (falls column vorhanden)
+    await supabase.from("jobs").update({ status: "done", closed_at: now }).eq("id", jobId);
+
+    setMsg("✅ Auftrag abgeschlossen");
+    await load();
+  }
+
+  function exportCsv() {
+    if (!job) return;
+
+    const header = [
+      "job_title",
+      "customer",
+      "vehicle",
+      "plate",
+      "job_status",
+      "worker",
+      "task",
+      "start",
+      "end",
+      "duration_min",
+    ].join(",");
+
+    const rows = entries
+      .slice()
+      .reverse()
+      .map((e) => {
+        const dur = durationMinutes(e.start_ts, e.end_ts);
+        const cols = [
+          job.title,
+          job.customer || "",
+          job.vehicle || "",
+          job.plate || "",
+          job.status || "open",
+          e.worker,
+          e.task || "",
+          e.start_ts,
+          e.end_ts || "",
+          String(dur),
+        ].map((x) => JSON.stringify(x));
+        return cols.join(",");
+      });
+
+    const csv = [header, ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `rapport_${(job.plate || "ohne-kennzeichen").replace(/\s+/g, "_")}_${jobId}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function exportPdfChef() {
+    if (!ensureAdmin(adminPin)) return;
+    if (!job) return;
 
     try {
-      setLoading(true);
+      setBusyPdf(true);
 
-      // 1) Job erstellen
-      const { data, error } = await supabase
-        .from("jobs")
-        .insert({
-          title: title.trim() || "Auftrag",
-          customer: customer.trim() || null,
-          vehicle: vehicle.trim() || null,
-          plate: plate.trim().toUpperCase(),
-          status: "open",
-        })
-        .select("id")
-        .single();
+      const { jsPDF } = await import("jspdf");
+      const doc = new jsPDF({ unit: "pt", format: "a4" });
 
-      if (error) throw new Error(error.message);
+      const margin = 40;
+      let y = 46;
 
-      const jobId = data.id as string;
+      doc.setFontSize(16);
+      doc.text("Pro Automobile – Rapport", margin, y);
+      y += 18;
 
-      // 2) Pflicht-Fotos hochladen (Ausweis + KM)
-      await uploadRequiredPhoto(jobId, ausweisFile, "ausweis");
-      await uploadRequiredPhoto(jobId, kmFile, "km");
+      doc.setFontSize(10);
+      doc.text(`Auftrag: ${job.title}`, margin, y); y += 14;
+      doc.text(`Kunde: ${job.customer || "-"}`, margin, y); y += 14;
+      doc.text(`Fahrzeug: ${job.vehicle || "-"}`, margin, y); y += 14;
+      doc.text(`Kontrollschild: ${job.plate || "-"}`, margin, y); y += 14;
+      doc.text(`Status: ${job.status || "open"}`, margin, y); y += 14;
+      doc.text(`Erstellt: ${toLocal(job.created_at || null)}`, margin, y); y += 14;
+      doc.text(`Abgeschlossen: ${toLocal(job.closed_at || null)}`, margin, y); y += 18;
 
-      // 3) Weiter zur Auftrag-Seite
-      window.location.href = `/job/${jobId}`;
+      doc.setFontSize(11);
+      doc.text(`Total: ${fmtMin(totals.total)}`, margin, y);
+      y += 18;
+
+      // Tabelle einfach (ohne autotable dependency)
+      doc.setFontSize(10);
+      doc.text("Mitarbeiter / Tätigkeit / Start / Ende / Dauer", margin, y);
+      y += 12;
+
+      const lines = entries
+        .slice()
+        .reverse()
+        .map((e) => {
+          const dur = durationMinutes(e.start_ts, e.end_ts);
+          return `${e.worker} | ${e.task || "-"} | ${toLocal(e.start_ts)} | ${e.end_ts ? toLocal(e.end_ts) : "läuft…"} | ${fmtMin(dur)}`;
+        });
+
+      for (const line of lines) {
+        const chunks = doc.splitTextToSize(line, 515);
+        doc.text(chunks, margin, y);
+        y += chunks.length * 12;
+        if (y > 700) { doc.addPage(); y = 40; }
+      }
+
+      // Pflichtbilder: KM & Ausweis (nur wenn vorhanden)
+      const km = photos.find((p) => p.name.toLowerCase().startsWith("km_"));
+      const ausweis = photos.find((p) => p.name.toLowerCase().startsWith("ausweis_"));
+
+      async function addImageBlock(title: string, url?: string) {
+        if (!url) return;
+        if (y > 620) { doc.addPage(); y = 40; }
+        doc.setFontSize(12);
+        doc.text(title, margin, y);
+        y += 10;
+
+        const dataUrl = await fetchAsDataUrl(url);
+        // Bild skalieren (max width 515, max height 240)
+        doc.addImage(dataUrl, "JPEG", margin, y + 6, 515, 240);
+        y += 260;
+      }
+
+      await addImageBlock("Kilometerstand Foto", km?.url);
+      await addImageBlock("Fahrzeugausweis Foto", ausweis?.url);
+
+      // Unterschrift (wenn gespeichert)
+      if (job.signature_url) {
+        if (y > 640) { doc.addPage(); y = 40; }
+        doc.setFontSize(12);
+        doc.text("Unterschrift", margin, y);
+        y += 10;
+
+        // signature_url ist meistens bereits URL (oder Storage URL) – wir nutzen sie direkt
+        const sigDataUrl = await fetchAsDataUrl(job.signature_url);
+        doc.addImage(sigDataUrl, "PNG", margin, y + 6, 260, 120);
+        y += 140;
+
+        doc.setFontSize(10);
+        doc.text(`Name: ${job.signature_name || "-"}`, margin, y); y += 14;
+        doc.text(`Zeit: ${toLocal(job.signature_at || null)}`, margin, y); y += 14;
+      }
+
+      doc.save(`rapport_${(job.plate || "ohne-kennzeichen").replace(/\s+/g, "_")}_${jobId}.pdf`);
     } catch (e: any) {
-      setMsg(e?.message || "Fehler beim Erstellen");
+      alert("PDF Fehler: " + (e?.message || String(e)));
     } finally {
-      setLoading(false);
+      setBusyPdf(false);
     }
   }
 
-  const chefActive = isAdmin();
+  async function saveSignature() {
+    if (!job) return;
+    if (!ensureAdmin(adminPin)) return;
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const dataUrl = canvas.toDataURL("image/png");
+    if (!dataUrl || dataUrl.length < 100) return alert("Unterschrift fehlt.");
+
+    setSignBusy(true);
+    try {
+      const blob = await (await fetch(dataUrl)).blob();
+
+      const filename = `signature_${Date.now()}.png`;
+      const path = `${jobId}/${filename}`;
+
+      const { error } = await supabase.storage.from(BUCKET).upload(path, blob, {
+        cacheControl: "3600",
+        upsert: true,
+        contentType: "image/png",
+      });
+      if (error) throw new Error(error.message);
+
+      const { data: signed } = await supabase.storage.from(BUCKET).createSignedUrl(path, 60 * 60 * 24 * 30);
+      const signedUrl = signed?.signedUrl;
+
+      // Wir speichern URL direkt in jobs.signature_url
+      const now = new Date().toISOString();
+      const { error: upErr } = await supabase
+        .from("jobs")
+        .update({
+          signature_url: signedUrl || null,
+          signature_name: (signName || "").trim() || null,
+          signature_at: now,
+        })
+        .eq("id", jobId);
+
+      if (upErr) throw new Error(upErr.message);
+
+      alert("✅ Unterschrift gespeichert");
+      await load();
+    } catch (e: any) {
+      alert("Unterschrift Fehler: " + (e?.message || String(e)));
+    } finally {
+      setSignBusy(false);
+    }
+  }
+
+  // Simple Draw on Canvas
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    ctx.lineWidth = 3;
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "#ffffff";
+
+    let drawing = false;
+
+    const getPos = (e: any) => {
+      const rect = canvas.getBoundingClientRect();
+      const clientX = e.touches?.[0]?.clientX ?? e.clientX;
+      const clientY = e.touches?.[0]?.clientY ?? e.clientY;
+      return { x: clientX - rect.left, y: clientY - rect.top };
+    };
+
+    const down = (e: any) => { drawing = true; const p = getPos(e); ctx.beginPath(); ctx.moveTo(p.x, p.y); };
+    const move = (e: any) => { if (!drawing) return; const p = getPos(e); ctx.lineTo(p.x, p.y); ctx.stroke(); };
+    const up = () => { drawing = false; };
+
+    canvas.addEventListener("mousedown", down);
+    canvas.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+
+    canvas.addEventListener("touchstart", down, { passive: true } as any);
+    canvas.addEventListener("touchmove", move, { passive: true } as any);
+    window.addEventListener("touchend", up);
+
+    return () => {
+      canvas.removeEventListener("mousedown", down);
+      canvas.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+
+      canvas.removeEventListener("touchstart", down as any);
+      canvas.removeEventListener("touchmove", move as any);
+      window.removeEventListener("touchend", up);
+    };
+  }, []);
 
   return (
     <div>
+      <a href="/" style={{ textDecoration: "none" }}>← zurück</a>
+
       <div className="card">
-        <div className="row" style={{ alignItems: "center", justifyContent: "space-between" }}>
+        <div className="row">
           <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
             <div className="logoWrap">
               <img src="/icons/logo.png" alt="Pro Automobile" />
             </div>
             <div>
-              <div className="h1">Pro Automobile</div>
-              <div className="muted">Auftrag erstellen → Pflicht-Fotos → Start/Stop am Handy</div>
+              <div className="h1">{job?.title || "Auftrag"}</div>
+              <div className="muted">{[job?.customer, job?.vehicle, job?.plate].filter(Boolean).join(" · ")}</div>
+              <div className="muted" style={{ fontSize: 12 }}>
+                {done ? `✅ Abgeschlossen: ${toLocal(job?.closed_at || null)}` : `🟠 Offen (erstellt: ${toLocal(job?.created_at || null)})`}
+              </div>
             </div>
           </div>
 
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             <span className="pill">
-              <span className="dot" style={{ background: chefActive ? "#30d158" : "#ff453a" }} />
-              {chefActive ? "Chef Modus" : "Normal"}
+              <span className="dot" style={{ background: requiredOk.ok ? "#30d158" : "#ff453a" }} />
+              Pflicht-Fotos: {requiredOk.ok ? "OK" : "fehlt"}
             </span>
-
-            {chefActive ? (
-              <button className="btn" onClick={logoutAdmin}>Chef abmelden</button>
-            ) : (
-              <button className="btn" onClick={() => ensureAdmin(adminPin)}>Chef PIN</button>
-            )}
           </div>
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="h2">Neuen Auftrag anlegen (Pflicht: Ausweis + KM Foto)</div>
-
-        <div className="grid2" style={{ marginTop: 10 }}>
-          <input className="input" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Auftrag Titel" />
-          <input className="input" value={customer} onChange={(e) => setCustomer(e.target.value)} placeholder="Kunde (optional)" />
-          <input className="input" value={vehicle} onChange={(e) => setVehicle(e.target.value)} placeholder="Fahrzeug (optional)" />
-          <input
-            className="input"
-            value={plate}
-            onChange={(e) => setPlate(e.target.value.toUpperCase())}
-            placeholder="Kontrollschild (Pflicht)"
-          />
-        </div>
-
-        <div className="grid2" style={{ marginTop: 12 }}>
-          <label className="btn btnPrimary" style={{ cursor: "pointer" }}>
-            Fahrzeugausweis Foto (Pflicht)
-            <input
-              type="file"
-              accept="image/*"
-              capture="environment"
-              style={{ display: "none" }}
-              onChange={(e) => {
-                const f = e.target.files?.[0] || null;
-                e.target.value = "";
-                setAusweisFile(f);
-              }}
-            />
-          </label>
-
-          <label className="btn btnPrimary" style={{ cursor: "pointer" }}>
-            Kilometerstand Foto (Pflicht)
-            <input
-              type="file"
-              accept="image/*"
-              capture="environment"
-              style={{ display: "none" }}
-              onChange={(e) => {
-                const f = e.target.files?.[0] || null;
-                e.target.value = "";
-                setKmFile(f);
-              }}
-            />
-          </label>
-        </div>
-
-        <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <span className="pill">
-            <span className="dot" style={{ background: ausweisFile ? "#30d158" : "#ff453a" }} />
-            Ausweis: {ausweisFile ? "OK" : "fehlt"}
-          </span>
-          <span className="pill">
-            <span className="dot" style={{ background: kmFile ? "#30d158" : "#ff453a" }} />
-            KM: {kmFile ? "OK" : "fehlt"}
-          </span>
-          <span className="muted" style={{ fontSize: 12 }}>
-            (Fotos werden im Auftrag gespeichert, damit du später beim Rechnungen schreiben schnell schauen kannst.)
-          </span>
-        </div>
-
-        {msg && <div className="muted" style={{ marginTop: 10 }}>{msg}</div>}
-
-        <div style={{ marginTop: 12 }}>
-          <button className="btn btnDanger" disabled={!canCreate || loading} onClick={createJob}>
-            {loading ? "Erstellt…" : "Auftrag erstellen"}
-          </button>
         </div>
       </div>
 
       <div className="card">
         <div className="row">
-          <div className="h2">Suche (offen + abgeschlossen)</div>
-          <input className="input" placeholder="Suche: Kontrollschild / Kunde / Fahrzeug / Titel" value={q} onChange={(e) => setQ(e.target.value)} />
+          <div>
+            <div className="h2">QR-Link (Auftrag scannen)</div>
+            <div className="muted" style={{ fontSize: 13, wordBreak: "break-all" }}>{jobLink}</div>
+          </div>
+          <img src={qrUrl} alt="QR" style={{ width: 140, height: 140, borderRadius: 16 }} />
         </div>
       </div>
 
+      {/* Pflicht-Fotos Block */}
       <div className="card">
-        <div className="h2">Aktuelle Aufträge</div>
-        {filteredOpen.length === 0 ? (
-          <div className="muted" style={{ marginTop: 10 }}>Keine offenen Aufträge.</div>
+        <div className="row" style={{ alignItems: "flex-start" }}>
+          <div style={{ flex: 1 }}>
+            <div className="h2">Pflicht-Fotos (Ausweis + Kilometer)</div>
+            <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+              Abschluss ist nur möglich, wenn <b>KM-Foto</b> (und Ausweis) vorhanden ist.
+            </div>
+
+            <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <label className="btn btnPrimary" style={{ cursor: "pointer" }}>
+                Fahrzeugausweis Foto hinzufügen
+                <input
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  style={{ display: "none" }}
+                  onChange={async (e) => {
+                    const file = e.target.files?.[0];
+                    e.target.value = "";
+                    if (!file) return;
+                    await uploadPhoto(file, "ausweis");
+                  }}
+                />
+              </label>
+
+              <label className="btn btnPrimary" style={{ cursor: "pointer" }}>
+                Kilometerstand Foto hinzufügen
+                <input
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  style={{ display: "none" }}
+                  onChange={async (e) => {
+                    const file = e.target.files?.[0];
+                    e.target.value = "";
+                    if (!file) return;
+                    await uploadPhoto(file, "km");
+                  }}
+                />
+              </label>
+            </div>
+
+            <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <span className="pill">
+                <span className="dot" style={{ background: requiredOk.hasAusweis ? "#30d158" : "#ff453a" }} />
+                Ausweis: {requiredOk.hasAusweis ? "OK" : "fehlt"}
+              </span>
+              <span className="pill">
+                <span className="dot" style={{ background: requiredOk.hasKm ? "#30d158" : "#ff453a" }} />
+                KM: {requiredOk.hasKm ? "OK" : "fehlt"}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Start/Stop */}
+      <div className="card">
+        <div className="row">
+          <div className="h2">Start / Stop</div>
+          <div className="muted" style={{ fontSize: 12 }}>{msg}</div>
+        </div>
+
+        <div className="grid2" style={{ marginTop: 10 }}>
+          <select className="select" value={worker} onChange={(e) => setWorker(e.target.value)}>
+            {WORKERS.map((w) => <option key={w} value={w}>{w}</option>)}
+          </select>
+
+          <select className="select" value={task} onChange={(e) => setTask(e.target.value)}>
+            {TASKS.map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </div>
+
+        <div className="grid2" style={{ marginTop: 10 }}>
+          <button className="btn btnPrimary" onClick={start} disabled={!!runningId || done}>Start</button>
+          <button className="btn btnDark" onClick={stop} disabled={!runningId}>Stop</button>
+        </div>
+
+        <div className="grid2" style={{ marginTop: 10 }}>
+          <button className="btn btnDanger" onClick={closeJob} disabled={done}>
+            Auftrag abschliessen ✅
+          </button>
+          <button className="btn" onClick={exportCsv}>CSV Rapport</button>
+        </div>
+
+        <div className="grid2" style={{ marginTop: 10 }}>
+          <button className="btn" onClick={exportPdfChef} disabled={busyPdf}>
+            {busyPdf ? "PDF…" : "PDF Rapport (Chef)"}
+          </button>
+          <div className="muted" style={{ fontSize: 12, alignSelf: "center" }}>
+            PDF enthält KM-Foto + Ausweis + Unterschrift (wenn vorhanden).
+          </div>
+        </div>
+      </div>
+
+      {/* Rapport */}
+      <div className="card">
+        <div className="h2">Rapport</div>
+        <div style={{ marginTop: 8 }}>
+          <b>Total:</b> {fmtMin(totals.total)}
+        </div>
+
+        {Object.entries(totals.perWorker).map(([w, m]) => (
+          <div key={w}>{w}: {fmtMin(m)}</div>
+        ))}
+
+        <div style={{ marginTop: 12, overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr>
+                <th style={{ textAlign: "left", padding: 8, opacity: 0.7 }}>Mitarbeiter</th>
+                <th style={{ textAlign: "left", padding: 8, opacity: 0.7 }}>Tätigkeit</th>
+                <th style={{ textAlign: "left", padding: 8, opacity: 0.7 }}>Start</th>
+                <th style={{ textAlign: "left", padding: 8, opacity: 0.7 }}>Ende</th>
+              </tr>
+            </thead>
+            <tbody>
+              {entries.map((e) => (
+                <tr key={e.id}>
+                  <td style={{ padding: 8 }}>{e.worker}</td>
+                  <td style={{ padding: 8 }}>{e.task || ""}</td>
+                  <td style={{ padding: 8 }}>{toLocal(e.start_ts)}</td>
+                  <td style={{ padding: 8 }}>{e.end_ts ? toLocal(e.end_ts) : <b>läuft…</b>}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Schaden-Fotos + Löschen */}
+      <div className="card">
+        <div className="row">
+          <div>
+            <div className="h2">Fotos (Ausweis / KM / Schäden)</div>
+            <div className="muted" style={{ fontSize: 12 }}>
+              Löschen ist Chef-geschützt.
+            </div>
+          </div>
+
+          <label className="btn btnPrimary" style={{ cursor: "pointer" }}>
+            Schaden-Foto hinzufügen
+            <input
+              type="file"
+              accept="image/*"
+              capture="environment"
+              style={{ display: "none" }}
+              onChange={async (e) => {
+                const file = e.target.files?.[0];
+                e.target.value = "";
+                if (!file) return;
+                await uploadPhoto(file, "schaden");
+              }}
+            />
+          </label>
+        </div>
+
+        {photos.length === 0 ? (
+          <div className="muted" style={{ marginTop: 10 }}>Noch keine Fotos.</div>
         ) : (
-          <div style={{ marginTop: 10, display: "grid", gap: 10 }}>
-            {filteredOpen.map((j) => (
-              <a key={j.id} className="jobCard" href={`/job/${j.id}`} style={{ textDecoration: "none" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                  <div>
-                    <div className="jobTitle">{j.title}</div>
-                    <div className="muted">{[j.customer, j.vehicle, j.plate].filter(Boolean).join(" · ")}</div>
-                    <div className="muted" style={{ fontSize: 12 }}>Erstellt: {toLocal(j.created_at || null)}</div>
+          <div
+            style={{
+              marginTop: 12,
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))",
+              gap: 12,
+            }}
+          >
+            {photos.map((p) => (
+              <div
+                key={p.path}
+                style={{
+                  borderRadius: 16,
+                  overflow: "hidden",
+                  border: "1px solid rgba(255,255,255,0.08)",
+                }}
+              >
+                <a href={p.url} target="_blank" rel="noreferrer">
+                  <img
+                    src={p.url}
+                    alt="Foto"
+                    style={{ width: "100%", height: 130, objectFit: "cover", display: "block" }}
+                  />
+                </a>
+
+                <div style={{ padding: 8 }}>
+                  <div className="muted" style={{ fontSize: 11, wordBreak: "break-all" }}>
+                    {p.name}
                   </div>
-                  <span className="pill">
-                    <span className="dot" />
-                    {badge(j.status)}
-                  </span>
+                  <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                    <button className="btn" onClick={() => window.open(p.url, "_blank")}>Öffnen</button>
+                    <button className="btn btnDanger" onClick={() => deletePhoto(p.path)}>Löschen</button>
+                  </div>
                 </div>
-              </a>
+              </div>
             ))}
           </div>
         )}
       </div>
 
+      {/* Unterschrift */}
       <div className="card">
-        <div className="h2">Abgeschlossene Aufträge</div>
-        {filteredDone.length === 0 ? (
-          <div className="muted" style={{ marginTop: 10 }}>Keine abgeschlossenen Aufträge.</div>
-        ) : (
-          <div style={{ marginTop: 10, display: "grid", gap: 10 }}>
-            {filteredDone.map((j) => (
-              <a key={j.id} className="jobCard" href={`/job/${j.id}`} style={{ textDecoration: "none", opacity: 0.92 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                  <div>
-                    <div className="jobTitle">{j.title}</div>
-                    <div className="muted">{[j.customer, j.vehicle, j.plate].filter(Boolean).join(" · ")}</div>
-                    <div className="muted" style={{ fontSize: 12 }}>
-                      Abgeschlossen: {toLocal(j.closed_at || null)}
-                    </div>
-                  </div>
-                  <span className="pill">
-                    <span className="dot" style={{ background: "#30d158" }} />
-                    {badge(j.status)}
-                  </span>
-                </div>
-              </a>
-            ))}
+        <div className="h2">Unterschrift (Chef)</div>
+        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+          Wird im PDF übernommen, sobald gespeichert.
+        </div>
+
+        <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <input
+            className="input"
+            value={signName}
+            onChange={(e) => setSignName(e.target.value)}
+            placeholder="Name (optional)"
+            style={{ minWidth: 220 }}
+          />
+          <button className="btn" onClick={() => {
+            const c = canvasRef.current;
+            if (!c) return;
+            const ctx = c.getContext("2d");
+            if (!ctx) return;
+            ctx.clearRect(0, 0, c.width, c.height);
+          }}>
+            Löschen
+          </button>
+          <button className="btn btnPrimary" onClick={saveSignature} disabled={signBusy}>
+            {signBusy ? "Speichert…" : "Unterschrift speichern"}
+          </button>
+        </div>
+
+        <div style={{ marginTop: 12, borderRadius: 16, overflow: "hidden", border: "1px solid rgba(255,255,255,0.12)" }}>
+          <canvas ref={canvasRef} width={700} height={220} style={{ width: "100%", height: 180, background: "rgba(255,255,255,0.03)" }} />
+        </div>
+
+        {job?.signature_url && (
+          <div style={{ marginTop: 12 }}>
+            <div className="muted" style={{ fontSize: 12 }}>Gespeicherte Unterschrift:</div>
+            <img src={job.signature_url} alt="Unterschrift" style={{ marginTop: 6, width: 260, borderRadius: 12 }} />
           </div>
         )}
-      </div>
-
-      <div className="muted" style={{ fontSize: 12, marginTop: 14 }}>
-        Installation: iPhone Safari → Teilen → „Zum Home-Bildschirm“. Samsung/Chrome → ⋮ → „App installieren“.
       </div>
     </div>
   );
