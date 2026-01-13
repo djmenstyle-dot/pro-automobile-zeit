@@ -11,13 +11,12 @@ export function isAdmin() {
 }
 
 /**
- * Aktiviert Chef-Modus (24h) per PIN-Check.
- * expectedPin kommt aus NEXT_PUBLIC_ADMIN_PIN
+ * Frontend Chef-Modus (24h)
  */
-export function ensureAdmin(expectedPin: string): boolean {
+export function ensureAdmin(adminPinEnv: string): boolean {
   if (typeof window === "undefined") return false;
 
-  if (!expectedPin) {
+  if (!adminPinEnv) {
     alert("Admin PIN fehlt (NEXT_PUBLIC_ADMIN_PIN in Vercel setzen).");
     return false;
   }
@@ -27,7 +26,7 @@ export function ensureAdmin(expectedPin: string): boolean {
   const p = prompt("Chef PIN eingeben:");
   if (!p) return false;
 
-  if (p.trim() !== expectedPin.trim()) {
+  if (p.trim() !== adminPinEnv) {
     alert("PIN falsch");
     return false;
   }
@@ -39,25 +38,20 @@ export function ensureAdmin(expectedPin: string): boolean {
 }
 
 /**
- * Nur PIN abfragen (für API Calls wie Foto löschen).
- * expectedPin ist der richtige PIN (NEXT_PUBLIC_ADMIN_PIN)
+ * PIN Abfrage (für Server-Delete etc.)
  */
-export function promptAdminPin(expectedPin: string): string | null {
+export function promptAdminPin(adminPinEnv: string): string | null {
   if (typeof window === "undefined") return null;
-
-  if (!expectedPin) {
+  if (!adminPinEnv) {
     alert("Admin PIN fehlt (NEXT_PUBLIC_ADMIN_PIN in Vercel setzen).");
     return null;
   }
-
   const p = prompt("Chef PIN eingeben:");
   if (!p) return null;
-
-  if (p.trim() !== expectedPin.trim()) {
+  if (p.trim() !== adminPinEnv) {
     alert("PIN falsch");
     return null;
   }
-
   return p.trim();
 }
 
