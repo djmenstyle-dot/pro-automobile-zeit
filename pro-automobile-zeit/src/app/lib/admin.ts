@@ -1,26 +1,23 @@
 export const ADMIN_SESSION_KEY = "proauto_admin_until";
 
-function nowMs() {
+export function nowMs() {
   return Date.now();
 }
 
-/**
- * Chef-Modus aktiv? (24h Session im localStorage)
- */
-export function isAdmin(): boolean {
+export function isAdmin() {
   if (typeof window === "undefined") return false;
   const until = Number(localStorage.getItem(ADMIN_SESSION_KEY) || "0");
   return until > nowMs();
 }
 
 /**
- * Fragt Chef-PIN ab und setzt Chef-Modus 24h aktiv.
- * adminPin kommt aus NEXT_PUBLIC_ADMIN_PIN.
+ * Aktiviert Chef-Modus (24h) per PIN-Check.
+ * expectedPin kommt aus NEXT_PUBLIC_ADMIN_PIN
  */
-export function ensureAdmin(adminPin: string): boolean {
+export function ensureAdmin(expectedPin: string): boolean {
   if (typeof window === "undefined") return false;
 
-  if (!adminPin) {
+  if (!expectedPin) {
     alert("Admin PIN fehlt (NEXT_PUBLIC_ADMIN_PIN in Vercel setzen).");
     return false;
   }
@@ -30,7 +27,7 @@ export function ensureAdmin(adminPin: string): boolean {
   const p = prompt("Chef PIN eingeben:");
   if (!p) return false;
 
-  if (p.trim() !== adminPin) {
+  if (p.trim() !== expectedPin.trim()) {
     alert("PIN falsch");
     return false;
   }
@@ -39,6 +36,29 @@ export function ensureAdmin(adminPin: string): boolean {
   localStorage.setItem(ADMIN_SESSION_KEY, String(nowMs() + 24 * 60 * 60 * 1000));
   alert("✅ Chef-Modus aktiv (24h)");
   return true;
+}
+
+/**
+ * Nur PIN abfragen (für API Calls wie Foto löschen).
+ * expectedPin ist der richtige PIN (NEXT_PUBLIC_ADMIN_PIN)
+ */
+export function promptAdminPin(expectedPin: string): string | null {
+  if (typeof window === "undefined") return null;
+
+  if (!expectedPin) {
+    alert("Admin PIN fehlt (NEXT_PUBLIC_ADMIN_PIN in Vercel setzen).");
+    return null;
+  }
+
+  const p = prompt("Chef PIN eingeben:");
+  if (!p) return null;
+
+  if (p.trim() !== expectedPin.trim()) {
+    alert("PIN falsch");
+    return null;
+  }
+
+  return p.trim();
 }
 
 export function logoutAdmin() {
