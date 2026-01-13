@@ -127,14 +127,17 @@ export default function JobPage({ params }: { params: { id: string } }) {
 
     const items = (data || []).filter((x) => x.name && x.name !== ".emptyFolderPlaceholder");
 
-    const out: PhotoItem[] = [];
-    for (const it of items) {
-      const path = `${jobId}/${it.name}`;
-      const { data: signed } = await supabase.storage.from(BUCKET).createSignedUrl(path, 60 * 60 * 24 * 7);
-      if (signed?.signedUrl) out.push({ path, name: it.name, url: signed.signedUrl });
-    }
+    // Parallel statt langsam nacheinander -> fühlt sich “weniger laden” an
+    const signed = await Promise.all(
+      items.map(async (it) => {
+        const path = `${jobId}/${it.name}`;
+        const { data: s } = await supabase.storage.from(BUCKET).createSignedUrl(path, 60 * 60 * 24 * 7);
+        if (!s?.signedUrl) return null;
+        return { path, name: it.name, url: s.signedUrl } as PhotoItem;
+      })
+    );
 
-    setPhotos(out);
+    setPhotos(signed.filter(Boolean) as PhotoItem[]);
   };
 
   const uploadPhoto = async (file: File, kind: "ausweis" | "km" | "schaden") => {
@@ -227,7 +230,12 @@ export default function JobPage({ params }: { params: { id: string } }) {
     const existing = entries.find((e) => e.worker === worker && !e.end_ts);
     if (existing) return setMsg("Läuft bereits…");
 
-    const { data, error } = await supabase.from("time_entries").insert({ job_id: jobId, worker, task }).select("id").single();
+    const { data, error } = await supabase
+      .from("time_entries")
+      .insert({ job_id: jobId, worker, task })
+      .select("id")
+      .single();
+
     if (error) return setMsg(error.message);
 
     setRunningId(data.id);
@@ -271,8 +279,12 @@ export default function JobPage({ params }: { params: { id: string } }) {
       const doc = new jsPDF({ unit: "pt", format: "a4" });
 
       const margin = 40;
+      const pageW = 595;
+      const usableW = pageW - margin * 2;
+
       let y = 46;
 
+      // Kopf
       doc.setFontSize(16);
       doc.text("Pro Automobile – Rapport", margin, y);
       y += 18;
@@ -286,58 +298,113 @@ export default function JobPage({ params }: { params: { id: string } }) {
       doc.text(`Erstellt: ${toLocal(job.created_at || null)}`, margin, y); y += 14;
       doc.text(`Abgeschlossen: ${toLocal(job.closed_at || null)}`, margin, y); y += 18;
 
+      // ✅ Schwarzer Balken “Rapport Übersicht”
+      const barH = 22;
+      doc.setFillColor(0, 0, 0);
+      doc.rect(margin, y, usableW, barH, "F");
+      doc.setTextColor(255, 255, 255);
+      doc.setFontSize(12);
+      doc.text("Rapport – Übersicht", margin + 10, y + 15);
+      doc.setTextColor(0, 0, 0);
+      y += barH + 12;
+
+      // Totale
       doc.setFontSize(11);
       doc.text(`Total: ${fmtMin(totals.total)}`, margin, y);
-      y += 18;
+      y += 16;
 
       doc.setFontSize(10);
-      doc.text("Mitarbeiter / Tätigkeit / Start / Ende / Dauer", margin, y);
-      y += 12;
+      Object.entries(totals.perWorker).forEach(([w, m]) => {
+        doc.text(`${w}: ${fmtMin(m)}`, margin, y);
+        y += 12;
+      });
+      y += 10;
 
-      const lines = entries
-        .slice()
-        .reverse()
-        .map((e) => {
-          const dur = durationMinutes(e.start_ts, e.end_ts);
-          return `${e.worker} | ${e.task || "-"} | ${toLocal(e.start_ts)} | ${e.end_ts ? toLocal(e.end_ts) : "läuft…"} | ${fmtMin(dur)}`;
-        });
+      // ✅ Tabelle (klar + schön)
+      const col = {
+        worker: margin,
+        task: margin + 120,
+        start: margin + 270,
+        end: margin + 400,
+        min: margin + 510,
+      };
 
-      for (const line of lines) {
-        const chunks = doc.splitTextToSize(line, 515);
-        doc.text(chunks, margin, y);
-        y += chunks.length * 12;
-        if (y > 700) { doc.addPage(); y = 40; }
-      }
+      // Header black bar
+      if (y > 720) { doc.addPage(); y = 40; }
+      doc.setFillColor(0, 0, 0);
+      doc.rect(margin, y, usableW, 20, "F");
+      doc.setTextColor(255, 255, 255);
+      doc.setFontSize(10);
+      doc.text("Mitarbeiter", col.worker + 6, y + 14);
+      doc.text("Tätigkeit", col.task + 6, y + 14);
+      doc.text("Start", col.start + 6, y + 14);
+      doc.text("Ende", col.end + 6, y + 14);
+      doc.text("Min", col.min + 6, y + 14);
+      doc.setTextColor(0, 0, 0);
+      y += 26;
 
-      // ✅ FIX: keine function-Deklaration im Block!
+      const rows = entries.slice().reverse(); // chronologisch
+
+      rows.forEach((e) => {
+        if (y > 760) { doc.addPage(); y = 40; }
+
+        const dur = durationMinutes(e.start_ts, e.end_ts);
+        const start = toLocal(e.start_ts);
+        const end = e.end_ts ? toLocal(e.end_ts) : "läuft…";
+
+        doc.setFontSize(9);
+        doc.text(String(e.worker || ""), col.worker + 6, y);
+        doc.text(String(e.task || "-"), col.task + 6, y);
+        doc.text(start, col.start + 6, y);
+        doc.text(end, col.end + 6, y);
+        doc.text(String(dur), col.min + 6, y);
+
+        y += 14;
+      });
+
+      y += 10;
+
+      // ✅ Fotos (KM & Ausweis)
       const addImageBlock = async (title: string, url?: string) => {
         if (!url) return;
         if (y > 620) { doc.addPage(); y = 40; }
 
-        doc.setFontSize(12);
-        doc.text(title, margin, y);
-        y += 10;
+        // Titelbar black
+        doc.setFillColor(0, 0, 0);
+        doc.rect(margin, y, usableW, 18, "F");
+        doc.setTextColor(255, 255, 255);
+        doc.setFontSize(11);
+        doc.text(title, margin + 10, y + 13);
+        doc.setTextColor(0, 0, 0);
+        y += 24;
 
         const { dataUrl, kind } = await fetchAsDataUrl(url);
-        doc.addImage(dataUrl, kind, margin, y + 6, 515, 240);
-        y += 260;
+
+        // Bildbox max (h 260)
+        doc.addImage(dataUrl, kind, margin, y, usableW, 260);
+        y += 270;
       };
 
       const km = kmPhotos[0];
       const ausweis = ausweisPhotos[0];
-
       await addImageBlock("Kilometerstand Foto", km?.url);
       await addImageBlock("Fahrzeugausweis Foto", ausweis?.url);
 
+      // ✅ Unterschrift im PDF (wenn vorhanden)
       if (job.signature_url) {
-        if (y > 640) { doc.addPage(); y = 40; }
-        doc.setFontSize(12);
-        doc.text("Unterschrift", margin, y);
-        y += 10;
+        if (y > 680) { doc.addPage(); y = 40; }
+
+        doc.setFillColor(0, 0, 0);
+        doc.rect(margin, y, usableW, 18, "F");
+        doc.setTextColor(255, 255, 255);
+        doc.setFontSize(11);
+        doc.text("Unterschrift", margin + 10, y + 13);
+        doc.setTextColor(0, 0, 0);
+        y += 24;
 
         const { dataUrl, kind } = await fetchAsDataUrl(job.signature_url);
-        doc.addImage(dataUrl, kind, margin, y + 6, 260, 120);
-        y += 140;
+        doc.addImage(dataUrl, kind, margin, y, 260, 120);
+        y += 130;
 
         doc.setFontSize(10);
         doc.text(`Name: ${job.signature_name || "-"}`, margin, y); y += 14;
@@ -399,7 +466,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
     }
   };
 
-  // Canvas Draw
+  // ✅ Canvas Draw: Schwarz auf Weiss
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -407,9 +474,13 @@ export default function JobPage({ params }: { params: { id: string } }) {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
+    // Hintergrund weiss
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
     ctx.lineWidth = 3;
     ctx.lineCap = "round";
-    ctx.strokeStyle = "#ffffff";
+    ctx.strokeStyle = "#000000";
 
     let drawing = false;
 
@@ -420,8 +491,20 @@ export default function JobPage({ params }: { params: { id: string } }) {
       return { x: clientX - rect.left, y: clientY - rect.top };
     };
 
-    const down = (e: any) => { drawing = true; const p = getPos(e); ctx.beginPath(); ctx.moveTo(p.x, p.y); };
-    const move = (e: any) => { if (!drawing) return; const p = getPos(e); ctx.lineTo(p.x, p.y); ctx.stroke(); };
+    const down = (e: any) => {
+      drawing = true;
+      const p = getPos(e);
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+    };
+
+    const move = (e: any) => {
+      if (!drawing) return;
+      const p = getPos(e);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    };
+
     const up = () => { drawing = false; };
 
     canvas.addEventListener("mousedown", down);
@@ -445,18 +528,40 @@ export default function JobPage({ params }: { params: { id: string } }) {
 
   const chefActive = typeof window !== "undefined" ? isAdmin() : false;
 
+  // Kleine helper zum Clear (weiss füllen, nicht transparent)
+  const clearSignature = () => {
+    const c = canvasRef.current;
+    if (!c) return;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, c.width, c.height);
+  };
+
   return (
-    <div className="container">
+    <div
+      style={{
+        maxWidth: 1200,
+        margin: "0 auto",
+        padding: "16px 16px 80px",
+        boxSizing: "border-box",
+      }}
+    >
       <a href="/" style={{ textDecoration: "none" }}>← zurück</a>
 
       <div className="card">
-        <div className="row">
-          <div style={{ display: "flex", gap: 12, alignItems: "center", minWidth: 260 }}>
+        <div className="row" style={{ flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: 12, alignItems: "center", minWidth: 260, flex: "1 1 420px" }}>
             <div className="logoWrap">
               <img
                 src="/icons/logo.png"
                 alt="Pro Automobile"
-                onError={(e) => { (e.currentTarget as any).src = "/icons/logo.svg"; }}
+                loading="eager"
+                onError={(e) => {
+                  // ✅ verhindert Endlosschleife
+                  (e.currentTarget as any).onerror = null;
+                  (e.currentTarget as any).src = "/icons/logo.svg";
+                }}
               />
             </div>
             <div style={{ minWidth: 0 }}>
@@ -470,7 +575,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
             </div>
           </div>
 
-          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", justifyContent: "flex-end", flex: "1 1 260px" }}>
             <span className="pill">
               <span className="dot" style={{ background: requiredOk.ok ? "var(--ok)" : "var(--bad)" }} />
               Pflicht-Fotos: {requiredOk.ok ? "OK" : "fehlt"}
@@ -490,12 +595,16 @@ export default function JobPage({ params }: { params: { id: string } }) {
       </div>
 
       <div className="card">
-        <div className="row">
-          <div style={{ minWidth: 260 }}>
+        <div className="row" style={{ flexWrap: "wrap" }}>
+          <div style={{ minWidth: 260, flex: "1 1 520px" }}>
             <div className="h2">QR-Link (Auftrag scannen)</div>
             <div className="muted" style={{ fontSize: 13, wordBreak: "break-all" }}>{jobLink}</div>
           </div>
-          <img src={qrUrl} alt="QR" style={{ width: 140, height: 140, borderRadius: 16, border: "1px solid rgba(255,255,255,0.12)" }} />
+          <img
+            src={qrUrl}
+            alt="QR"
+            style={{ width: 140, height: 140, borderRadius: 16, border: "1px solid rgba(255,255,255,0.12)" }}
+          />
         </div>
       </div>
 
@@ -599,15 +708,33 @@ export default function JobPage({ params }: { params: { id: string } }) {
         {damagePhotos.length === 0 ? (
           <div className="muted" style={{ marginTop: 10 }}>Noch keine Schadenfotos.</div>
         ) : (
-          <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(170px, 1fr))", gap: 12 }}>
+          <div
+            style={{
+              marginTop: 12,
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))",
+              gap: 12,
+              alignItems: "start",
+            }}
+          >
             {damagePhotos.map((p) => (
-              <div key={p.path} style={{ borderRadius: 16, overflow: "hidden", border: "1px solid rgba(255,255,255,0.08)", background: "rgba(0,0,0,0.18)" }}>
+              <div
+                key={p.path}
+                style={{
+                  borderRadius: 16,
+                  overflow: "hidden",
+                  border: "1px solid rgba(255,255,255,0.08)",
+                  background: "rgba(0,0,0,0.18)",
+                }}
+              >
                 <a href={p.url} target="_blank" rel="noreferrer">
-                  <img src={p.url} alt="Foto" style={{ width: "100%", height: 130, objectFit: "cover", display: "block" }} />
+                  <img src={p.url} alt="Foto" style={{ width: "100%", height: 140, objectFit: "cover", display: "block" }} />
                 </a>
-                <div style={{ padding: 8 }}>
+
+                <div style={{ padding: 10 }}>
                   <div className="muted" style={{ fontSize: 11, wordBreak: "break-all" }}>{p.name}</div>
-                  <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+
+                  <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
                     <button className="btn" onClick={() => window.open(p.url, "_blank")}>Öffnen</button>
                     <button className="btn btnDanger" onClick={() => deletePhoto(p.path)}>Löschen</button>
                   </div>
@@ -622,19 +749,31 @@ export default function JobPage({ params }: { params: { id: string } }) {
         <div className="h2">Unterschrift (Chef)</div>
 
         <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <input className="input" value={signName} onChange={(e) => setSignName(e.target.value)} placeholder="Name (optional)" style={{ minWidth: 220, flex: 1 }} />
-          <button className="btn" onClick={() => {
-            const c = canvasRef.current;
-            if (!c) return;
-            const ctx = c.getContext("2d");
-            if (!ctx) return;
-            ctx.clearRect(0, 0, c.width, c.height);
-          }}>Löschen</button>
-          <button className="btn btnPrimary" onClick={saveSignature} disabled={signBusy}>{signBusy ? "Speichert…" : "Unterschrift speichern"}</button>
+          <input
+            className="input"
+            value={signName}
+            onChange={(e) => setSignName(e.target.value)}
+            placeholder="Name (optional)"
+            style={{ minWidth: 220, flex: 1 }}
+          />
+          <button className="btn" onClick={clearSignature}>Löschen</button>
+          <button className="btn btnPrimary" onClick={saveSignature} disabled={signBusy}>
+            {signBusy ? "Speichert…" : "Unterschrift speichern"}
+          </button>
         </div>
 
         <div style={{ marginTop: 12, borderRadius: 16, overflow: "hidden", border: "1px solid rgba(255,255,255,0.12)" }}>
-          <canvas ref={canvasRef} width={900} height={240} style={{ width: "100%", height: 190, background: "rgba(255,255,255,0.03)", display: "block" }} />
+          <canvas
+            ref={canvasRef}
+            width={900}
+            height={240}
+            style={{
+              width: "100%",
+              height: 190,
+              background: "#ffffff",
+              display: "block",
+            }}
+          />
         </div>
 
         {job?.signature_url && (
