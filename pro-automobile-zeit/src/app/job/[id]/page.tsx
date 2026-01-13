@@ -14,7 +14,9 @@ type Job = {
   created_at?: string | null;
   closed_at?: string | null;
 
+  // Unterschrift (wir unterstützen beides: path (neu) & url (alt))
   signature_path?: string | null;
+  signature_url?: string | null;
   signature_name?: string | null;
   signature_at?: string | null;
 };
@@ -28,22 +30,12 @@ type Entry = {
   end_ts: string | null;
 };
 
-type PhotoItem = {
-  path: string;
-  name: string;
-  signedUrl: string;
-  kind: "ausweis" | "km" | "schaden" | "signature" | "other";
-};
+type PhotoItem = { path: string; name: string; url: string };
 
 const WORKERS = ["Esteban", "Eron", "Jeremie", "Tsvetan", "Mensel"];
 const TASKS = ["Service", "Diagnose", "Bremsen", "Reifen", "MFK", "Elektrik", "Klima", "Probefahrt", "Sonstiges"];
 
 const BUCKET = "job-photos";
-
-// Pflicht-Dateinamen (fix), damit Erkennung IMMER klappt:
-const AUSWEIS_FILE = "ausweis.jpg";
-const KM_FILE = "km.jpg";
-const SIGNATURE_FILE = "signature.png";
 
 function toLocal(iso?: string | null) {
   if (!iso) return "";
@@ -64,41 +56,40 @@ function fmtMin(min: number) {
   return `${h}h ${m}min`;
 }
 
-/** robust: lädt Bild als Blob und wandelt es in JPEG DataURL um (PDF-stabil) */
+/** Lädt Bild als DataURL und konvertiert stabil zu JPEG (fix für PNG-Probleme in jsPDF) */
 async function imageUrlToJpegDataUrl(url: string): Promise<string> {
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`Bild konnte nicht geladen werden (${res.status})`);
   const blob = await res.blob();
 
-  const bmp = await createImageBitmap(blob);
+  // decode -> canvas -> jpeg
+  const bmp = await createImageBitmap(blob).catch(() => null);
+  if (!bmp) throw new Error("Bild konnte nicht dekodiert werden (kaputt?)");
+
   const canvas = document.createElement("canvas");
   canvas.width = bmp.width;
   canvas.height = bmp.height;
   const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Canvas ctx fehlt");
+  if (!ctx) throw new Error("Canvas Fehler");
+
   ctx.drawImage(bmp, 0, 0);
-  // JPEG ist für jsPDF viel stabiler als PNG
-  return canvas.toDataURL("image/jpeg", 0.9);
+  // JPEG ist stabil in jsPDF
+  return canvas.toDataURL("image/jpeg", 0.88);
 }
 
-function classifyName(name: string): PhotoItem["kind"] {
-  const n = name.toLowerCase();
-  if (n === AUSWEIS_FILE) return "ausweis";
-  if (n === KM_FILE) return "km";
-  if (n === SIGNATURE_FILE) return "signature";
-  if (n.startsWith("schaden_")) return "schaden";
-
-  // Backward compatibility (alte uploads)
-  if (n.startsWith("ausweis_")) return "ausweis";
-  if (n.startsWith("km_")) return "km";
-  if (n.startsWith("signature_")) return "signature";
-
-  return "other";
+/** Signed URL helper */
+async function signedUrl(bucket: string, path: string, seconds: number) {
+  const { data, error } = await supabase.storage.from(bucket).createSignedUrl(path, seconds);
+  if (error) throw new Error(error.message);
+  if (!data?.signedUrl) throw new Error("Keine Signed URL");
+  return data.signedUrl;
 }
 
 export default function JobPage({ params }: { params: { id: string } }) {
   const jobId = params.id;
-  const adminPin = process.env.NEXT_PUBLIC_ADMIN_PIN || "";
+
+  // Chef PIN (Frontend Check für "Chef-Modus")
+  const adminPinEnv = process.env.NEXT_PUBLIC_ADMIN_PIN || "";
 
   const [job, setJob] = useState<Job | null>(null);
   const [entries, setEntries] = useState<Entry[]>([]);
@@ -107,10 +98,11 @@ export default function JobPage({ params }: { params: { id: string } }) {
   const [runningId, setRunningId] = useState<string | null>(null);
   const [msg, setMsg] = useState<string>("");
 
+  // Fotos
   const [photos, setPhotos] = useState<PhotoItem[]>([]);
   const [busyPdf, setBusyPdf] = useState(false);
 
-  // Unterschrift
+  // Unterschrift Canvas
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [signName, setSignName] = useState("");
   const [signBusy, setSignBusy] = useState(false);
@@ -123,17 +115,17 @@ export default function JobPage({ params }: { params: { id: string } }) {
     [jobLink]
   );
 
-  const required = useMemo(() => {
-    const hasAusweis = photos.some((p) => p.kind === "ausweis");
-    const hasKm = photos.some((p) => p.kind === "km");
-    return { hasAusweis, hasKm, ok: hasAusweis && hasKm };
+  const requiredPhotos = useMemo(() => {
+    const ausweis = photos.find((p) => p.name.toLowerCase().startsWith("ausweis_"));
+    const km = photos.find((p) => p.name.toLowerCase().startsWith("km_"));
+    return {
+      ausweis,
+      km,
+      ok: !!ausweis && !!km,
+    };
   }, [photos]);
 
-  const ausweisPhoto = useMemo(() => photos.find((p) => p.kind === "ausweis") || null, [photos]);
-  const kmPhoto = useMemo(() => photos.find((p) => p.kind === "km") || null, [photos]);
-  const signaturePhoto = useMemo(() => photos.find((p) => p.kind === "signature") || null, [photos]);
-
-  const schadenPhotos = useMemo(() => photos.filter((p) => p.kind === "schaden"), [photos]);
+  const damagePhotos = useMemo(() => photos.filter((p) => p.name.toLowerCase().startsWith("schaden_")), [photos]);
 
   async function refreshPhotos() {
     const { data, error } = await supabase.storage.from(BUCKET).list(jobId, {
@@ -148,52 +140,28 @@ export default function JobPage({ params }: { params: { id: string } }) {
     }
 
     const items = (data || []).filter((x) => x.name && x.name !== ".emptyFolderPlaceholder");
-
     const out: PhotoItem[] = [];
+
     for (const it of items) {
-      const name = it.name;
-      const path = `${jobId}/${name}`;
-
-      // immer frische signed URLs (7 Tage)
-      const { data: signed, error: signErr } = await supabase.storage.from(BUCKET).createSignedUrl(path, 60 * 60 * 24 * 7);
-      if (signErr || !signed?.signedUrl) continue;
-
-      out.push({
-        path,
-        name,
-        signedUrl: signed.signedUrl,
-        kind: classifyName(name),
-      });
+      const path = `${jobId}/${it.name}`;
+      try {
+        const url = await signedUrl(BUCKET, path, 60 * 60 * 24 * 30); // 30 Tage, wird immer neu erzeugt
+        out.push({ path, name: it.name, url });
+      } catch (e) {
+        // falls ein einzelnes Bild spinnt, App soll trotzdem laufen
+        console.warn("signed url fail for", path);
+      }
     }
 
     setPhotos(out);
   }
 
-  async function uploadFixedPhoto(file: File, fixedName: string) {
+  async function uploadPhoto(file: File, kind: "ausweis" | "km" | "schaden") {
     const ext = (file.name.split(".").pop() || "jpg").toLowerCase();
     const safeExt = ["jpg", "jpeg", "png", "webp"].includes(ext) ? ext : "jpg";
 
-    // Wir speichern immer als .jpg für Stabilität (und überschreiben)
-    const path = `${jobId}/${fixedName.replace(/\.(jpg|jpeg|png|webp)$/i, ".jpg")}`;
-
-    const { error } = await supabase.storage.from(BUCKET).upload(path, file, {
-      cacheControl: "3600",
-      upsert: true, // überschreiben!
-      contentType: file.type || "image/jpeg",
-    });
-
-    if (error) {
-      alert("Upload Fehler: " + error.message);
-      return;
-    }
-
-    await refreshPhotos();
-  }
-
-  async function uploadDamagePhoto(file: File) {
-    const ext = (file.name.split(".").pop() || "jpg").toLowerCase();
-    const safeExt = ["jpg", "jpeg", "png", "webp"].includes(ext) ? ext : "jpg";
-    const filename = `schaden_${Date.now()}_${Math.random().toString(16).slice(2)}.${safeExt}`;
+    const prefix = `${kind}_`;
+    const filename = `${prefix}${Date.now()}_${Math.random().toString(16).slice(2)}.${safeExt}`;
     const path = `${jobId}/${filename}`;
 
     const { error } = await supabase.storage.from(BUCKET).upload(path, file, {
@@ -211,20 +179,21 @@ export default function JobPage({ params }: { params: { id: string } }) {
   }
 
   async function deletePhoto(path: string) {
-    // Chef-only + server delete
-    const pin = promptAdminPin(adminPin);
-    if (!pin) return;
+    if (!ensureAdmin(adminPinEnv)) return;
 
     const ok = confirm("Foto wirklich löschen?");
     if (!ok) return;
 
-    const res = await fetch("/api/admin/delete-photo", {
+    const pin = promptAdminPin();
+    if (!pin) return;
+
+    const res = await fetch("/api/storage/delete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ bucket: BUCKET, paths: [path], pin }),
+      body: JSON.stringify({ bucket: BUCKET, path, pin }),
     });
 
-    const json = await res.json().catch(() => null);
+    const json = await res.json().catch(() => ({} as any));
     if (!res.ok || !json?.ok) {
       alert("Löschen fehlgeschlagen: " + (json?.error || res.statusText));
       return;
@@ -279,7 +248,12 @@ export default function JobPage({ params }: { params: { id: string } }) {
     const existing = entries.find((e) => e.worker === worker && !e.end_ts);
     if (existing) return setMsg("Läuft bereits…");
 
-    const { data, error } = await supabase.from("time_entries").insert({ job_id: jobId, worker, task }).select("id").single();
+    const { data, error } = await supabase
+      .from("time_entries")
+      .insert({ job_id: jobId, worker, task })
+      .select("id")
+      .single();
+
     if (error) return setMsg(error.message);
 
     setRunningId(data.id);
@@ -289,7 +263,11 @@ export default function JobPage({ params }: { params: { id: string } }) {
 
   async function stop() {
     if (!runningId) return;
-    const { error } = await supabase.from("time_entries").update({ end_ts: new Date().toISOString() }).eq("id", runningId);
+    const { error } = await supabase
+      .from("time_entries")
+      .update({ end_ts: new Date().toISOString() })
+      .eq("id", runningId);
+
     if (error) return setMsg(error.message);
 
     setRunningId(null);
@@ -300,8 +278,11 @@ export default function JobPage({ params }: { params: { id: string } }) {
   async function closeJob() {
     setMsg("");
 
-    if (!required.hasKm) return setMsg("❗ Abschluss nicht möglich: Kilometer Foto fehlt.");
-    if (!required.hasAusweis) return setMsg("❗ Abschluss nicht möglich: Fahrzeugausweis Foto fehlt.");
+    if (!requiredPhotos.ok) {
+      if (!requiredPhotos.km) return setMsg("❗ Abschluss nicht möglich: Kilometer Foto fehlt.");
+      if (!requiredPhotos.ausweis) return setMsg("❗ Abschluss nicht möglich: Fahrzeugausweis Foto fehlt.");
+      return setMsg("❗ Pflicht-Fotos fehlen.");
+    }
 
     const now = new Date().toISOString();
 
@@ -313,29 +294,51 @@ export default function JobPage({ params }: { params: { id: string } }) {
   }
 
   async function reopenJobChef() {
-    if (!ensureAdmin(adminPin)) return;
+    if (!ensureAdmin(adminPinEnv)) return;
 
     const ok = confirm("Auftrag wieder öffnen?");
     if (!ok) return;
 
+    const now = new Date().toISOString();
     await supabase.from("jobs").update({ status: "open", closed_at: null }).eq("id", jobId);
-    setMsg("🔓 Auftrag wieder offen");
+
+    setMsg(`🔓 Wieder geöffnet (${toLocal(now)})`);
     await load();
   }
 
   function exportCsv() {
     if (!job) return;
 
-    const header = ["job_title", "customer", "vehicle", "plate", "job_status", "worker", "task", "start", "end", "duration_min"].join(",");
+    const header = [
+      "job_title",
+      "customer",
+      "vehicle",
+      "plate",
+      "job_status",
+      "worker",
+      "task",
+      "start",
+      "end",
+      "duration_min",
+    ].join(",");
 
     const rows = entries
       .slice()
       .reverse()
       .map((e) => {
         const dur = durationMinutes(e.start_ts, e.end_ts);
-        const cols = [job.title, job.customer || "", job.vehicle || "", job.plate || "", job.status || "open", e.worker, e.task || "", e.start_ts, e.end_ts || "", String(dur)].map(
-          (x) => JSON.stringify(x)
-        );
+        const cols = [
+          job.title,
+          job.customer || "",
+          job.vehicle || "",
+          job.plate || "",
+          job.status || "open",
+          e.worker,
+          e.task || "",
+          e.start_ts,
+          e.end_ts || "",
+          String(dur),
+        ].map((x) => JSON.stringify(x));
         return cols.join(",");
       });
 
@@ -351,17 +354,19 @@ export default function JobPage({ params }: { params: { id: string } }) {
   }
 
   async function exportPdfChef() {
-    if (!ensureAdmin(adminPin)) return;
+    if (!ensureAdmin(adminPinEnv)) return;
     if (!job) return;
 
     try {
       setBusyPdf(true);
-      const { jsPDF } = await import("jspdf");
 
+      const { jsPDF } = await import("jspdf");
       const doc = new jsPDF({ unit: "pt", format: "a4" });
+
       const margin = 40;
       let y = 46;
 
+      // Header + Logo (robust)
       doc.setFontSize(16);
       doc.text("Pro Automobile – Rapport", margin, y);
       y += 18;
@@ -395,36 +400,62 @@ export default function JobPage({ params }: { params: { id: string } }) {
         const chunks = doc.splitTextToSize(line, 515);
         doc.text(chunks, margin, y);
         y += chunks.length * 12;
-        if (y > 700) { doc.addPage(); y = 40; }
+        if (y > 700) {
+          doc.addPage();
+          y = 40;
+        }
       }
 
-      const addImageBlock = async (title: string, signedUrl?: string) => {
-        if (!signedUrl) return;
-        if (y > 620) { doc.addPage(); y = 40; }
+      async function addImageBlock(title: string, url?: string) {
+        if (!url) return;
+        if (y > 620) {
+          doc.addPage();
+          y = 40;
+        }
 
         doc.setFontSize(12);
         doc.text(title, margin, y);
         y += 10;
 
-        const jpegDataUrl = await imageUrlToJpegDataUrl(signedUrl);
-
-        // in A4 Breite rein, Höhe automatisch ungefähr
+        // stabil: konvertiere zu JPEG
+        const jpegDataUrl = await imageUrlToJpegDataUrl(url);
         doc.addImage(jpegDataUrl, "JPEG", margin, y + 6, 515, 240);
         y += 260;
-      };
+      }
 
-      await addImageBlock("Kilometerstand Foto", kmPhoto?.signedUrl || undefined);
-      await addImageBlock("Fahrzeugausweis Foto", ausweisPhoto?.signedUrl || undefined);
+      // Pflichtbilder
+      await addImageBlock("Kilometerstand Foto", requiredPhotos.km?.url);
+      await addImageBlock("Fahrzeugausweis Foto", requiredPhotos.ausweis?.url);
 
-      // Unterschrift: wir nehmen signature_path und machen fresh signed url
+      // Unterschrift: immer frisch signieren (path bevorzugt)
+      let sigUrl: string | null = null;
       if (job.signature_path) {
-        const { data: signedSig } = await supabase.storage.from(BUCKET).createSignedUrl(job.signature_path, 60 * 60);
-        if (signedSig?.signedUrl) {
-          await addImageBlock("Unterschrift", signedSig.signedUrl);
-          doc.setFontSize(10);
-          doc.text(`Name: ${job.signature_name || "-"}`, margin, y); y += 14;
-          doc.text(`Zeit: ${toLocal(job.signature_at || null)}`, margin, y); y += 14;
+        try {
+          sigUrl = await signedUrl(BUCKET, job.signature_path, 60 * 60 * 24 * 30);
+        } catch {
+          sigUrl = null;
         }
+      } else if (job.signature_url) {
+        sigUrl = job.signature_url; // fallback alt
+      }
+
+      if (sigUrl) {
+        if (y > 640) {
+          doc.addPage();
+          y = 40;
+        }
+        doc.setFontSize(12);
+        doc.text("Unterschrift", margin, y);
+        y += 10;
+
+        // Signature ebenfalls stabil als JPEG rein
+        const sigJpeg = await imageUrlToJpegDataUrl(sigUrl);
+        doc.addImage(sigJpeg, "JPEG", margin, y + 6, 260, 120);
+        y += 140;
+
+        doc.setFontSize(10);
+        doc.text(`Name: ${job.signature_name || "-"}`, margin, y); y += 14;
+        doc.text(`Zeit: ${toLocal(job.signature_at || null)}`, margin, y); y += 14;
       }
 
       doc.save(`rapport_${(job.plate || "ohne-kennzeichen").replace(/\s+/g, "_")}_${jobId}.pdf`);
@@ -436,9 +467,8 @@ export default function JobPage({ params }: { params: { id: string } }) {
   }
 
   async function saveSignature() {
-    // Chef + DB update signature_path
-    if (!ensureAdmin(adminPin)) return;
     if (!job) return;
+    if (!ensureAdmin(adminPinEnv)) return;
 
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -449,7 +479,9 @@ export default function JobPage({ params }: { params: { id: string } }) {
     setSignBusy(true);
     try {
       const blob = await (await fetch(dataUrl)).blob();
-      const path = `${jobId}/${SIGNATURE_FILE}`;
+
+      const filename = `signature_${Date.now()}.png`;
+      const path = `${jobId}/${filename}`;
 
       const { error } = await supabase.storage.from(BUCKET).upload(path, blob, {
         cacheControl: "3600",
@@ -460,16 +492,30 @@ export default function JobPage({ params }: { params: { id: string } }) {
 
       const now = new Date().toISOString();
 
-      const { error: upErr } = await supabase
+      // Wir versuchen signature_path (besser). Wenn Column nicht existiert, fallback auf signature_url.
+      const tryPath = await supabase
         .from("jobs")
         .update({
           signature_path: path,
           signature_name: (signName || "").trim() || null,
           signature_at: now,
-        })
+        } as any)
         .eq("id", jobId);
 
-      if (upErr) throw new Error(upErr.message);
+      if (tryPath.error) {
+        // fallback alt: store signed url (aber wir nehmen lange)
+        const url = await signedUrl(BUCKET, path, 60 * 60 * 24 * 365 * 5); // 5 Jahre
+        const fallback = await supabase
+          .from("jobs")
+          .update({
+            signature_url: url,
+            signature_name: (signName || "").trim() || null,
+            signature_at: now,
+          } as any)
+          .eq("id", jobId);
+
+        if (fallback.error) throw new Error(fallback.error.message);
+      }
 
       alert("✅ Unterschrift gespeichert");
       await load();
@@ -480,7 +526,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
     }
   }
 
-  // Canvas draw
+  // Canvas Drawing
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -501,9 +547,21 @@ export default function JobPage({ params }: { params: { id: string } }) {
       return { x: clientX - rect.left, y: clientY - rect.top };
     };
 
-    const down = (e: any) => { drawing = true; const p = getPos(e); ctx.beginPath(); ctx.moveTo(p.x, p.y); };
-    const move = (e: any) => { if (!drawing) return; const p = getPos(e); ctx.lineTo(p.x, p.y); ctx.stroke(); };
-    const up = () => { drawing = false; };
+    const down = (e: any) => {
+      drawing = true;
+      const p = getPos(e);
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+    };
+    const move = (e: any) => {
+      if (!drawing) return;
+      const p = getPos(e);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    };
+    const up = () => {
+      drawing = false;
+    };
 
     canvas.addEventListener("mousedown", down);
     canvas.addEventListener("mousemove", move);
@@ -524,59 +582,141 @@ export default function JobPage({ params }: { params: { id: string } }) {
     };
   }, []);
 
+  // Logo fallback
+  const [logoSrc, setLogoSrc] = useState("/icons/logo.png");
+
   return (
     <div>
       <a href="/" style={{ textDecoration: "none" }}>← zurück</a>
 
       <div className="card">
-        <div className="row" style={{ alignItems: "center", gap: 12 }}>
+        <div className="row rowTop">
           <div style={{ display: "flex", gap: 12, alignItems: "center", minWidth: 0 }}>
             <div className="logoWrap">
-              <img src="/icons/logo.png" alt="Pro Automobile" />
+              <img
+                src={logoSrc}
+                alt="Pro Automobile"
+                onError={() => setLogoSrc("/icons/logo.svg")}
+                style={{ width: 42, height: 42, objectFit: "contain" }}
+              />
             </div>
             <div style={{ minWidth: 0 }}>
-              <div className="h1" style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                {job?.title || "Auftrag"}
-              </div>
-              <div className="muted" style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                {[job?.customer, job?.vehicle, job?.plate].filter(Boolean).join(" · ")}
-              </div>
+              <div className="h1">{job?.title || "Auftrag"}</div>
+              <div className="muted truncate">{[job?.customer, job?.vehicle, job?.plate].filter(Boolean).join(" · ")}</div>
               <div className="muted" style={{ fontSize: 12 }}>
                 {done ? `✅ Abgeschlossen: ${toLocal(job?.closed_at || null)}` : `🟠 Offen (erstellt: ${toLocal(job?.created_at || null)})`}
               </div>
             </div>
           </div>
 
-          <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
             <span className="pill">
-              <span className="dot" style={{ background: required.ok ? "#30d158" : "#ff453a" }} />
-              Pflicht-Fotos: {required.ok ? "OK" : "fehlt"}
+              <span className="dot" style={{ background: requiredPhotos.ok ? "#30d158" : "#ff453a" }} />
+              Pflicht-Fotos: {requiredPhotos.ok ? "OK" : "fehlt"}
             </span>
-            {done && (
-              <button className="btn" onClick={reopenJobChef}>
-                🔓 Wieder öffnen (Chef)
-              </button>
-            )}
+            {done ? (
+              <button className="btn btnDark" onClick={reopenJobChef}>🔓 Wieder öffnen (Chef)</button>
+            ) : null}
           </div>
         </div>
       </div>
 
       <div className="card">
-        <div className="row" style={{ alignItems: "center", gap: 16 }}>
+        <div className="row rowTop">
           <div style={{ minWidth: 0 }}>
             <div className="h2">QR-Link (Auftrag scannen)</div>
             <div className="muted" style={{ fontSize: 13, wordBreak: "break-all" }}>{jobLink}</div>
           </div>
-          <img src={qrUrl} alt="QR" style={{ width: 140, height: 140, borderRadius: 16, flex: "0 0 auto" }} />
+          <img src={qrUrl} alt="QR" style={{ width: 140, height: 140, borderRadius: 16 }} />
+        </div>
+      </div>
+
+      {/* Pflicht-Fotos */}
+      <div className="card">
+        <div className="h2">Fahrzeugausweis / Kilometer (Pflicht)</div>
+        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+          Ohne diese Fotos kann der Auftrag nicht abgeschlossen werden.
+        </div>
+
+        <div className="grid2" style={{ marginTop: 12 }}>
+          <div className="miniCard">
+            <div className="row rowTop">
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontWeight: 700 }}>Fahrzeugausweis Foto</div>
+                <div className="muted" style={{ fontSize: 12 }}>
+                  {requiredPhotos.ausweis ? `✅ vorhanden: ${requiredPhotos.ausweis.name}` : "❗ noch kein Foto"}
+                </div>
+              </div>
+              {requiredPhotos.ausweis ? (
+                <button className="btn" onClick={() => window.open(requiredPhotos.ausweis!.url, "_blank")}>Öffnen</button>
+              ) : null}
+            </div>
+
+            <label className="btn btnPrimary" style={{ cursor: "pointer", marginTop: 10, width: "100%" }}>
+              Ausweis Foto aufnehmen
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                style={{ display: "none" }}
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  e.target.value = "";
+                  if (!file) return;
+                  await uploadPhoto(file, "ausweis");
+                }}
+              />
+            </label>
+          </div>
+
+          <div className="miniCard">
+            <div className="row rowTop">
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontWeight: 700 }}>Kilometerstand Foto</div>
+                <div className="muted" style={{ fontSize: 12 }}>
+                  {requiredPhotos.km ? `✅ vorhanden: ${requiredPhotos.km.name}` : "❗ noch kein Foto"}
+                </div>
+              </div>
+              {requiredPhotos.km ? (
+                <button className="btn" onClick={() => window.open(requiredPhotos.km!.url, "_blank")}>Öffnen</button>
+              ) : null}
+            </div>
+
+            <label className="btn btnPrimary" style={{ cursor: "pointer", marginTop: 10, width: "100%" }}>
+              KM Foto aufnehmen
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                style={{ display: "none" }}
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  e.target.value = "";
+                  if (!file) return;
+                  await uploadPhoto(file, "km");
+                }}
+              />
+            </label>
+          </div>
+        </div>
+
+        <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <span className="pill">
+            <span className="dot" style={{ background: requiredPhotos.ausweis ? "#30d158" : "#ff453a" }} />
+            Ausweis: {requiredPhotos.ausweis ? "OK" : "fehlt"}
+          </span>
+          <span className="pill">
+            <span className="dot" style={{ background: requiredPhotos.km ? "#30d158" : "#ff453a" }} />
+            KM: {requiredPhotos.km ? "OK" : "fehlt"}
+          </span>
         </div>
       </div>
 
       {/* Start/Stop */}
       <div className="card">
-        <div className="row" style={{ alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <div className="row rowTop">
           <div className="h2">Start / Stop</div>
           <div className="muted" style={{ fontSize: 12 }}>{msg}</div>
-          <div style={{ marginLeft: "auto" }} />
         </div>
 
         <div className="grid2" style={{ marginTop: 10 }}>
@@ -606,99 +746,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
             {busyPdf ? "PDF…" : "Rapport als PDF (Chef)"}
           </button>
           <div className="muted" style={{ fontSize: 12, alignSelf: "center" }}>
-            PDF enthält KM + Ausweis + Unterschrift (wenn gespeichert).
-          </div>
-        </div>
-      </div>
-
-      {/* Pflichtfotos */}
-      <div className="card">
-        <div className="h2">Fahrzeugausweis / Kilometer (Pflicht)</div>
-        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
-          Ohne diese Fotos kann der Auftrag nicht abgeschlossen werden.
-        </div>
-
-        <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-          {/* Ausweis */}
-          <div style={{ border: "1px solid rgba(255,255,255,0.08)", borderRadius: 16, padding: 12 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <b>Fahrzeugausweis Foto</b>
-              <span className="pill">
-                <span className="dot" style={{ background: required.hasAusweis ? "#30d158" : "#ff453a" }} />
-                {required.hasAusweis ? "vorhanden" : "fehlt"}
-              </span>
-              <div style={{ marginLeft: "auto" }} />
-              {ausweisPhoto && (
-                <button className="btn" onClick={() => window.open(ausweisPhoto.signedUrl, "_blank")}>Öffnen</button>
-              )}
-            </div>
-
-            {ausweisPhoto ? (
-              <div className="muted" style={{ fontSize: 12, marginTop: 8, wordBreak: "break-all" }}>
-                {ausweisPhoto.name}
-              </div>
-            ) : (
-              <div className="muted" style={{ marginTop: 8 }}>Noch kein Foto vorhanden.</div>
-            )}
-
-            <div style={{ marginTop: 10 }}>
-              <label className="btn btnPrimary" style={{ cursor: "pointer", width: "100%", justifyContent: "center" }}>
-                Ausweis Foto speichern
-                <input
-                  type="file"
-                  accept="image/*"
-                  capture="environment"
-                  style={{ display: "none" }}
-                  onChange={async (e) => {
-                    const file = e.target.files?.[0];
-                    e.target.value = "";
-                    if (!file) return;
-                    await uploadFixedPhoto(file, AUSWEIS_FILE);
-                  }}
-                />
-              </label>
-            </div>
-          </div>
-
-          {/* KM */}
-          <div style={{ border: "1px solid rgba(255,255,255,0.08)", borderRadius: 16, padding: 12 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <b>Kilometerstand Foto</b>
-              <span className="pill">
-                <span className="dot" style={{ background: required.hasKm ? "#30d158" : "#ff453a" }} />
-                {required.hasKm ? "vorhanden" : "fehlt"}
-              </span>
-              <div style={{ marginLeft: "auto" }} />
-              {kmPhoto && (
-                <button className="btn" onClick={() => window.open(kmPhoto.signedUrl, "_blank")}>Öffnen</button>
-              )}
-            </div>
-
-            {kmPhoto ? (
-              <div className="muted" style={{ fontSize: 12, marginTop: 8, wordBreak: "break-all" }}>
-                {kmPhoto.name}
-              </div>
-            ) : (
-              <div className="muted" style={{ marginTop: 8 }}>Noch kein Foto vorhanden.</div>
-            )}
-
-            <div style={{ marginTop: 10 }}>
-              <label className="btn btnPrimary" style={{ cursor: "pointer", width: "100%", justifyContent: "center" }}>
-                KM Foto speichern
-                <input
-                  type="file"
-                  accept="image/*"
-                  capture="environment"
-                  style={{ display: "none" }}
-                  onChange={async (e) => {
-                    const file = e.target.files?.[0];
-                    e.target.value = "";
-                    if (!file) return;
-                    await uploadFixedPhoto(file, KM_FILE);
-                  }}
-                />
-              </label>
-            </div>
+            PDF enthält Pflicht-Fotos + Unterschrift (wenn gespeichert).
           </div>
         </div>
       </div>
@@ -740,13 +788,13 @@ export default function JobPage({ params }: { params: { id: string } }) {
 
       {/* Schadenfotos */}
       <div className="card">
-        <div className="row" style={{ alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <div className="row rowTop">
           <div>
             <div className="h2">Schadenfotos</div>
-            <div className="muted" style={{ fontSize: 12 }}>Löschen ist Chef-geschützt.</div>
+            <div className="muted" style={{ fontSize: 12 }}>
+              Löschen ist Chef-geschützt.
+            </div>
           </div>
-
-          <div style={{ marginLeft: "auto" }} />
 
           <label className="btn btnPrimary" style={{ cursor: "pointer" }}>
             Schaden-Foto hinzufügen
@@ -759,47 +807,26 @@ export default function JobPage({ params }: { params: { id: string } }) {
                 const file = e.target.files?.[0];
                 e.target.value = "";
                 if (!file) return;
-                await uploadDamagePhoto(file);
+                await uploadPhoto(file, "schaden");
               }}
             />
           </label>
         </div>
 
-        {schadenPhotos.length === 0 ? (
+        {damagePhotos.length === 0 ? (
           <div className="muted" style={{ marginTop: 10 }}>Noch keine Schadenfotos.</div>
         ) : (
-          <div
-            style={{
-              marginTop: 12,
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fill, minmax(170px, 1fr))",
-              gap: 12,
-            }}
-          >
-            {schadenPhotos.map((p) => (
-              <div
-                key={p.path}
-                style={{
-                  borderRadius: 16,
-                  overflow: "hidden",
-                  border: "1px solid rgba(255,255,255,0.08)",
-                  background: "rgba(255,255,255,0.02)"
-                }}
-              >
-                <a href={p.signedUrl} target="_blank" rel="noreferrer">
-                  <img
-                    src={p.signedUrl}
-                    alt="Foto"
-                    style={{ width: "100%", height: 140, objectFit: "cover", display: "block" }}
-                  />
+          <div className="photoGrid">
+            {damagePhotos.map((p) => (
+              <div key={p.path} className="photoCard">
+                <a href={p.url} target="_blank" rel="noreferrer">
+                  <img src={p.url} alt="Foto" className="photoImg" />
                 </a>
 
-                <div style={{ padding: 10 }}>
-                  <div className="muted" style={{ fontSize: 11, wordBreak: "break-all" }}>
-                    {p.name}
-                  </div>
-                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                    <button className="btn" onClick={() => window.open(p.signedUrl, "_blank")}>Öffnen</button>
+                <div className="photoMeta">
+                  <div className="muted" style={{ fontSize: 11, wordBreak: "break-all" }}>{p.name}</div>
+                  <div className="row" style={{ marginTop: 8, gap: 8 }}>
+                    <button className="btn" onClick={() => window.open(p.url, "_blank")}>Öffnen</button>
                     <button className="btn btnDanger" onClick={() => deletePhoto(p.path)}>Löschen</button>
                   </div>
                 </div>
@@ -816,7 +843,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
           Wird im PDF übernommen, sobald gespeichert.
         </div>
 
-        <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+        <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
           <input
             className="input"
             value={signName}
@@ -824,7 +851,6 @@ export default function JobPage({ params }: { params: { id: string } }) {
             placeholder="Name (optional)"
             style={{ minWidth: 220 }}
           />
-
           <button
             className="btn"
             onClick={() => {
@@ -837,34 +863,22 @@ export default function JobPage({ params }: { params: { id: string } }) {
           >
             Löschen
           </button>
-
           <button className="btn btnPrimary" onClick={saveSignature} disabled={signBusy}>
             {signBusy ? "Speichert…" : "Unterschrift speichern"}
           </button>
-
-          {job?.signature_path && (
-            <span className="pill">
-              <span className="dot" style={{ background: "#30d158" }} />
-              Unterschrift gespeichert
-            </span>
-          )}
         </div>
 
-        <div style={{ marginTop: 12, borderRadius: 16, overflow: "hidden", border: "1px solid rgba(255,255,255,0.12)" }}>
-          <canvas
-            ref={canvasRef}
-            width={700}
-            height={220}
-            style={{ width: "100%", height: 180, background: "rgba(255,255,255,0.03)", touchAction: "none" }}
-          />
+        <div className="signWrap">
+          <canvas ref={canvasRef} width={700} height={220} className="signCanvas" />
         </div>
 
-        {signaturePhoto && (
+        {/* Anzeige: wir benutzen vorhandene signature_url als fallback (alt) */}
+        {job?.signature_url ? (
           <div style={{ marginTop: 12 }}>
             <div className="muted" style={{ fontSize: 12 }}>Gespeicherte Unterschrift:</div>
-            <img src={signaturePhoto.signedUrl} alt="Unterschrift" style={{ marginTop: 6, width: 260, borderRadius: 12 }} />
+            <img src={job.signature_url} alt="Unterschrift" style={{ marginTop: 6, width: 260, borderRadius: 12 }} />
           </div>
-        )}
+        ) : null}
       </div>
     </div>
   );
