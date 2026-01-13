@@ -11,12 +11,13 @@ export function isAdmin() {
 }
 
 /**
- * Frontend Chef-Modus (24h)
+ * Fragt PIN ab und setzt Chef-Modus (24h).
+ * Returns true wenn Chef-Modus aktiv ist.
  */
-export function ensureAdmin(adminPinEnv: string): boolean {
+export function ensureAdmin(adminPin: string): boolean {
   if (typeof window === "undefined") return false;
 
-  if (!adminPinEnv) {
+  if (!adminPin) {
     alert("Admin PIN fehlt (NEXT_PUBLIC_ADMIN_PIN in Vercel setzen).");
     return false;
   }
@@ -26,33 +27,14 @@ export function ensureAdmin(adminPinEnv: string): boolean {
   const p = prompt("Chef PIN eingeben:");
   if (!p) return false;
 
-  if (p.trim() !== adminPinEnv) {
+  if (p.trim() !== adminPin) {
     alert("PIN falsch");
     return false;
   }
 
-  // 24h gültig
   localStorage.setItem(ADMIN_SESSION_KEY, String(nowMs() + 24 * 60 * 60 * 1000));
   alert("✅ Chef-Modus aktiv (24h)");
   return true;
-}
-
-/**
- * PIN Abfrage (für Server-Delete etc.)
- */
-export function promptAdminPin(adminPinEnv: string): string | null {
-  if (typeof window === "undefined") return null;
-  if (!adminPinEnv) {
-    alert("Admin PIN fehlt (NEXT_PUBLIC_ADMIN_PIN in Vercel setzen).");
-    return null;
-  }
-  const p = prompt("Chef PIN eingeben:");
-  if (!p) return null;
-  if (p.trim() !== adminPinEnv) {
-    alert("PIN falsch");
-    return null;
-  }
-  return p.trim();
 }
 
 export function logoutAdmin() {
