@@ -11,6 +11,17 @@ export function isAdmin() {
 }
 
 /**
+ * Optional: returns entered pin or null.
+ * Some older code imports this – so we keep it exported to avoid build errors.
+ */
+export function promptAdminPin(_expectedPin?: string): string | null {
+  if (typeof window === "undefined") return null;
+  const p = prompt("Chef PIN eingeben:");
+  if (!p) return null;
+  return p.trim() || null;
+}
+
+/**
  * Fragt PIN ab und setzt Chef-Modus (24h).
  * Returns true wenn Chef-Modus aktiv ist.
  */
@@ -24,10 +35,10 @@ export function ensureAdmin(adminPin: string): boolean {
 
   if (isAdmin()) return true;
 
-  const p = prompt("Chef PIN eingeben:");
+  const p = promptAdminPin(adminPin);
   if (!p) return false;
 
-  if (p.trim() !== adminPin) {
+  if (p !== adminPin) {
     alert("PIN falsch");
     return false;
   }
