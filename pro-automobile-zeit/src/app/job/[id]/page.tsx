@@ -4,17 +4,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "../../lib/supabaseClient";
 import { ensureAdmin } from "../../lib/admin";
 
-/**
- * Optional (empfohlen) in Supabase SQL Editor:
- *
- * alter table public.jobs
- * add column if not exists km_photo_path text,
- * add column if not exists ausweis_photo_path text,
- * add column if not exists signature_path text;
- *
- * (signature_url/signature_name/signature_at dürfen bleiben)
- */
-
 type Job = {
   id: string;
   title: string;
@@ -25,13 +14,11 @@ type Job = {
   created_at?: string | null;
   closed_at?: string | null;
 
-  // empfohlen
   km_photo_path?: string | null;
   ausweis_photo_path?: string | null;
-  signature_path?: string | null;
 
-  // legacy
-  signature_url?: string | null;
+  signature_path?: string | null; // <- NEU (SQL oben!)
+  signature_url?: string | null;  // preview signed url
   signature_name?: string | null;
   signature_at?: string | null;
 };
@@ -45,11 +32,7 @@ type Entry = {
   end_ts: string | null;
 };
 
-type PhotoItem = {
-  path: string;
-  name: string;
-  url: string; // signed url
-};
+type PhotoItem = { path: string; name: string; url: string };
 
 const WORKERS = ["Esteban", "Eron", "Jeremie", "Tsvetan", "Mensel"];
 const TASKS = ["Service", "Diagnose", "Bremsen", "Reifen", "MFK", "Elektrik", "Klima", "Probefahrt", "Sonstiges"];
@@ -58,8 +41,7 @@ const BUCKET = "job-photos";
 
 function toLocal(iso?: string | null) {
   if (!iso) return "";
-  const d = new Date(iso);
-  return d.toLocaleString("de-CH");
+  return new Date(iso).toLocaleString("de-CH");
 }
 
 function durationMinutes(start: string, end?: string | null) {
@@ -81,21 +63,22 @@ function baseNameFromPath(path: string) {
 }
 
 /**
- * Super wichtig für jsPDF:
- * PNGs aus Handy/Browser können Probleme machen -> wir wandeln ALLES in JPEG um.
+ * PDF-FIX: Bilder NICHT via Signed-URL fetchen.
+ * Stattdessen: Storage.download(path) -> Blob -> Canvas -> JPEG dataURL.
+ * Das verhindert "400" und "corrupt PNG".
  */
-async function fetchImageAsJpegDataUrl(url: string, quality = 0.9): Promise<string> {
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`Bild konnte nicht geladen werden (${res.status})`);
-  const blob = await res.blob();
+async function downloadPathAsJpegDataUrl(storagePath: string, quality = 0.9): Promise<string> {
+  const { data, error } = await supabase.storage.from(BUCKET).download(storagePath);
+  if (error || !data) throw new Error(`Bild konnte nicht geladen werden: ${error?.message || "download failed"}`);
 
+  const blob = data;
   const objectUrl = URL.createObjectURL(blob);
+
   try {
     const img = await new Promise<HTMLImageElement>((resolve, reject) => {
       const i = new Image();
       i.onload = () => resolve(i);
       i.onerror = () => reject(new Error("Bild konnte nicht dekodiert werden"));
-      i.crossOrigin = "anonymous";
       i.src = objectUrl;
     });
 
@@ -106,7 +89,6 @@ async function fetchImageAsJpegDataUrl(url: string, quality = 0.9): Promise<stri
     const ctx = canvas.getContext("2d");
     if (!ctx) throw new Error("Canvas nicht verfügbar");
 
-    // weißer Hintergrund (sonst wird transparent schwarz im JPEG)
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, 0, 0);
@@ -126,9 +108,8 @@ export default function JobPage({ params }: { params: { id: string } }) {
   const [worker, setWorker] = useState(WORKERS[0]);
   const [task, setTask] = useState(TASKS[0]);
   const [runningId, setRunningId] = useState<string | null>(null);
-  const [msg, setMsg] = useState<string>("");
+  const [msg, setMsg] = useState("");
 
-  // Fotos
   const [photos, setPhotos] = useState<PhotoItem[]>([]);
   const [busyPdf, setBusyPdf] = useState(false);
 
@@ -150,19 +131,6 @@ export default function JobPage({ params }: { params: { id: string } }) {
     () => `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(jobLink)}`,
     [jobLink]
   );
-
-  const requiredOk = useMemo(() => {
-    const hasKmByPath = !!job?.km_photo_path;
-    const hasAusweisByPath = !!job?.ausweis_photo_path;
-
-    const hasKmByPrefix = photos.some((p) => p.name.toLowerCase().startsWith("km_"));
-    const hasAusweisByPrefix = photos.some((p) => p.name.toLowerCase().startsWith("ausweis_"));
-
-    const hasKm = hasKmByPath || hasKmByPrefix;
-    const hasAusweis = hasAusweisByPath || hasAusweisByPrefix;
-
-    return { hasKm, hasAusweis, ok: hasKm && hasAusweis };
-  }, [photos, job?.km_photo_path, job?.ausweis_photo_path]);
 
   async function refreshPhotos() {
     const { data, error } = await supabase.storage.from(BUCKET).list(jobId, {
@@ -207,11 +175,7 @@ export default function JobPage({ params }: { params: { id: string } }) {
     await refreshPhotos();
   }
 
-  useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
   useEffect(() => {
     const running = entries.find((x) => x.worker === worker && !x.end_ts);
     setRunningId(running?.id || null);
@@ -229,33 +193,11 @@ export default function JobPage({ params }: { params: { id: string } }) {
     return { total, perWorker };
   }, [entries]);
 
-  async function start() {
-    if (done) return setMsg("Auftrag ist abgeschlossen.");
-    const existing = entries.find((e) => e.worker === worker && !e.end_ts);
-    if (existing) return setMsg("Läuft bereits…");
-
-    const { data, error } = await supabase
-      .from("time_entries")
-      .insert({ job_id: jobId, worker, task })
-      .select("id")
-      .single();
-
-    if (error) return setMsg(error.message);
-
-    setRunningId(data.id);
-    setMsg("✅ läuft…");
-    await load();
-  }
-
-  async function stop() {
-    if (!runningId) return;
-    const { error } = await supabase.from("time_entries").update({ end_ts: new Date().toISOString() }).eq("id", runningId);
-    if (error) return setMsg(error.message);
-
-    setRunningId(null);
-    setMsg("🛑 gestoppt");
-    await load();
-  }
+  const requiredOk = useMemo(() => {
+    const hasKm = !!job?.km_photo_path || photos.some((p) => p.name.toLowerCase().startsWith("km_"));
+    const hasAusweis = !!job?.ausweis_photo_path || photos.some((p) => p.name.toLowerCase().startsWith("ausweis_"));
+    return { hasKm, hasAusweis, ok: hasKm && hasAusweis };
+  }, [job?.km_photo_path, job?.ausweis_photo_path, photos]);
 
   function makeSafeFilename(kind: "km" | "ausweis" | "schaden", original: string) {
     const ext = (original.split(".").pop() || "jpg").toLowerCase();
@@ -289,9 +231,8 @@ export default function JobPage({ params }: { params: { id: string } }) {
         const path = await uploadPhoto(kmFile, "km");
         if (!path) return;
 
-        const patch: any = { km_photo_path: path };
-        const { error: upErr } = await supabase.from("jobs").update(patch).eq("id", jobId);
-        if (upErr) console.warn("km_photo_path update warning:", upErr.message);
+        const { error: upErr } = await supabase.from("jobs").update({ km_photo_path: path }).eq("id", jobId);
+        if (upErr) alert("DB Update Fehler: " + upErr.message);
 
         setKmFile(null);
         await load();
@@ -305,9 +246,8 @@ export default function JobPage({ params }: { params: { id: string } }) {
         const path = await uploadPhoto(ausweisFile, "ausweis");
         if (!path) return;
 
-        const patch: any = { ausweis_photo_path: path };
-        const { error: upErr } = await supabase.from("jobs").update(patch).eq("id", jobId);
-        if (upErr) console.warn("ausweis_photo_path update warning:", upErr.message);
+        const { error: upErr } = await supabase.from("jobs").update({ ausweis_photo_path: path }).eq("id", jobId);
+        if (upErr) alert("DB Update Fehler: " + upErr.message);
 
         setAusweisFile(null);
         await load();
@@ -317,13 +257,27 @@ export default function JobPage({ params }: { params: { id: string } }) {
     }
   }
 
+  function pickPhotoByStoredPathOrPrefix(kind: "km" | "ausweis") {
+    const stored = kind === "km" ? job?.km_photo_path : job?.ausweis_photo_path;
+    if (stored) {
+      const found = photos.find((p) => p.path === stored);
+      if (found) return found;
+    }
+    const pref = kind === "km" ? "km_" : "ausweis_";
+    return photos.find((p) => p.name.toLowerCase().startsWith(pref)) || null;
+  }
+
+  const kmPhoto = pickPhotoByStoredPathOrPrefix("km");
+  const ausweisPhoto = pickPhotoByStoredPathOrPrefix("ausweis");
+
+  const damagePhotos = useMemo(() => photos.filter((p) => p.name.toLowerCase().startsWith("schaden_")), [photos]);
+
   async function deletePhoto(path: string) {
     if (!ensureAdmin(adminPin)) return;
-
     const ok = confirm("Foto wirklich löschen?");
     if (!ok) return;
 
-    // falls Pflichtfoto -> Feld leeren (wenn Spalte existiert)
+    // Pflichtfelder leeren, falls nötig
     const patch: any = {};
     if (job?.km_photo_path === path) patch.km_photo_path = null;
     if (job?.ausweis_photo_path === path) patch.ausweis_photo_path = null;
@@ -335,24 +289,40 @@ export default function JobPage({ params }: { params: { id: string } }) {
     }
 
     const { error } = await supabase.storage.from(BUCKET).remove([path]);
+    if (error) return alert("Löschen fehlgeschlagen: " + error.message);
 
-    if (error) {
-      // SEHR wichtig: so siehst du ob es Policy/RLS ist
-      alert("Löschen fehlgeschlagen: " + error.message);
-      return;
-    }
+    await load();
+  }
 
+  async function start() {
+    if (done) return setMsg("Auftrag ist abgeschlossen.");
+    const existing = entries.find((e) => e.worker === worker && !e.end_ts);
+    if (existing) return setMsg("Läuft bereits…");
+
+    const { data, error } = await supabase.from("time_entries").insert({ job_id: jobId, worker, task }).select("id").single();
+    if (error) return setMsg(error.message);
+
+    setRunningId(data.id);
+    setMsg("✅ läuft…");
+    await load();
+  }
+
+  async function stop() {
+    if (!runningId) return;
+    const { error } = await supabase.from("time_entries").update({ end_ts: new Date().toISOString() }).eq("id", runningId);
+    if (error) return setMsg(error.message);
+
+    setRunningId(null);
+    setMsg("🛑 gestoppt");
     await load();
   }
 
   async function closeJob() {
     setMsg("");
-
     if (!requiredOk.hasKm) return setMsg("❗ Abschluss nicht möglich: Kilometer Foto fehlt.");
     if (!requiredOk.hasAusweis) return setMsg("❗ Abschluss nicht möglich: Fahrzeugausweis Foto fehlt.");
 
     const now = new Date().toISOString();
-
     await supabase.from("time_entries").update({ end_ts: now }).eq("job_id", jobId).is("end_ts", null);
     await supabase.from("jobs").update({ status: "done", closed_at: now }).eq("id", jobId);
 
@@ -406,31 +376,12 @@ export default function JobPage({ params }: { params: { id: string } }) {
     URL.revokeObjectURL(url);
   }
 
-  function pickPhotoByStoredPathOrPrefix(kind: "km" | "ausweis") {
-    const stored = kind === "km" ? job?.km_photo_path : job?.ausweis_photo_path;
-    if (stored) {
-      const found = photos.find((p) => p.path === stored);
-      if (found) return found;
-    }
-    const pref = kind === "km" ? "km_" : "ausweis_";
-    return photos.find((p) => p.name.toLowerCase().startsWith(pref)) || null;
-  }
-
-  const kmPhoto = pickPhotoByStoredPathOrPrefix("km");
-  const ausweisPhoto = pickPhotoByStoredPathOrPrefix("ausweis");
-
-  // Schadenfotos: NUR schaden_
-  const damagePhotos = useMemo(() => {
-    return photos.filter((p) => p.name.toLowerCase().startsWith("schaden_"));
-  }, [photos]);
-
   async function exportPdfChef() {
     if (!ensureAdmin(adminPin)) return;
     if (!job) return;
 
     try {
       setBusyPdf(true);
-
       const { jsPDF } = await import("jspdf");
       const doc = new jsPDF({ unit: "pt", format: "a4" });
 
@@ -470,49 +421,35 @@ export default function JobPage({ params }: { params: { id: string } }) {
         const chunks = doc.splitTextToSize(line, 515);
         doc.text(chunks, margin, y);
         y += chunks.length * 12;
-        if (y > 700) {
-          doc.addPage();
-          y = 40;
-        }
+        if (y > 700) { doc.addPage(); y = 40; }
       }
 
-      const addImageBlock = async (title: string, url?: string) => {
-        if (!url) return;
+      const addImageBlockFromPath = async (title: string, storagePath?: string | null) => {
+        if (!storagePath) return;
         if (y > 620) { doc.addPage(); y = 40; }
 
         doc.setFontSize(12);
         doc.text(title, margin, y);
         y += 10;
 
-        // IMMER JPEG konvertieren -> keine PNG Errors mehr
-        const dataUrl = await fetchImageAsJpegDataUrl(url, 0.9);
-        doc.addImage(dataUrl, "JPEG", margin, y + 6, 515, 240);
+        const jpegDataUrl = await downloadPathAsJpegDataUrl(storagePath, 0.9);
+        doc.addImage(jpegDataUrl, "JPEG", margin, y + 6, 515, 240);
         y += 260;
       };
 
-      // Pflichtbilder
-      await addImageBlock("Kilometerstand Foto", kmPhoto?.url);
-      await addImageBlock("Fahrzeugausweis Foto", ausweisPhoto?.url);
+      // Pflichtbilder: aus DB path, fallback auf gefundenes Photo
+      await addImageBlockFromPath("Kilometerstand Foto", job.km_photo_path || kmPhoto?.path || null);
+      await addImageBlockFromPath("Fahrzeugausweis Foto", job.ausweis_photo_path || ausweisPhoto?.path || null);
 
-      // Unterschrift: bevorzugt signature_path, sonst signature_url
-      let sigUrl: string | null = null;
-
+      // Unterschrift
       if (job.signature_path) {
-        const { data: signed } = await supabase.storage.from(BUCKET).createSignedUrl(job.signature_path, 60 * 60);
-        sigUrl = signed?.signedUrl || null;
-      } else if (job.signature_url) {
-        sigUrl = job.signature_url;
-      }
-
-      if (sigUrl) {
         if (y > 640) { doc.addPage(); y = 40; }
         doc.setFontSize(12);
         doc.text("Unterschrift", margin, y);
         y += 10;
 
-        // ebenfalls JPEG konvertieren (fix)
-        const sigDataUrl = await fetchImageAsJpegDataUrl(sigUrl, 0.92);
-        doc.addImage(sigDataUrl, "JPEG", margin, y + 6, 260, 120);
+        const sigJpg = await downloadPathAsJpegDataUrl(job.signature_path, 0.92);
+        doc.addImage(sigJpg, "JPEG", margin, y + 6, 260, 120);
         y += 140;
 
         doc.setFontSize(10);
@@ -541,7 +478,6 @@ export default function JobPage({ params }: { params: { id: string } }) {
     setSignBusy(true);
     try {
       const blob = await (await fetch(dataUrl)).blob();
-
       const filename = `signature_${Date.now()}.png`;
       const path = `${jobId}/${filename}`;
 
@@ -552,19 +488,21 @@ export default function JobPage({ params }: { params: { id: string } }) {
       });
       if (error) throw new Error(error.message);
 
-      // signed url für Vorschau
+      // Signed URL nur für Preview (nicht fürs PDF!)
       const { data: signed } = await supabase.storage.from(BUCKET).createSignedUrl(path, 60 * 60 * 24 * 30);
       const signedUrl = signed?.signedUrl || null;
 
       const now = new Date().toISOString();
-      const patch: any = {
-        signature_name: (signName || "").trim() || null,
-        signature_at: now,
-        signature_path: path,
-        signature_url: signedUrl, // preview
-      };
+      const { error: upErr } = await supabase
+        .from("jobs")
+        .update({
+          signature_path: path,
+          signature_url: signedUrl,
+          signature_name: (signName || "").trim() || null,
+          signature_at: now,
+        })
+        .eq("id", jobId);
 
-      const { error: upErr } = await supabase.from("jobs").update(patch).eq("id", jobId);
       if (upErr) throw new Error(upErr.message);
 
       alert("✅ Unterschrift gespeichert");
@@ -597,18 +535,8 @@ export default function JobPage({ params }: { params: { id: string } }) {
       return { x: clientX - rect.left, y: clientY - rect.top };
     };
 
-    const down = (e: any) => {
-      drawing = true;
-      const p = getPos(e);
-      ctx.beginPath();
-      ctx.moveTo(p.x, p.y);
-    };
-    const move = (e: any) => {
-      if (!drawing) return;
-      const p = getPos(e);
-      ctx.lineTo(p.x, p.y);
-      ctx.stroke();
-    };
+    const down = (e: any) => { drawing = true; const p = getPos(e); ctx.beginPath(); ctx.moveTo(p.x, p.y); };
+    const move = (e: any) => { if (!drawing) return; const p = getPos(e); ctx.lineTo(p.x, p.y); ctx.stroke(); };
     const up = () => { drawing = false; };
 
     canvas.addEventListener("mousedown", down);
@@ -642,7 +570,6 @@ export default function JobPage({ params }: { params: { id: string } }) {
                 src={`/icons/logo.png?v=1`}
                 alt="Pro Automobile"
                 onError={(e) => {
-                  // Fallback
                   (e.currentTarget as HTMLImageElement).src = `/logo.png?v=1`;
                 }}
               />
@@ -675,7 +602,6 @@ export default function JobPage({ params }: { params: { id: string } }) {
         </div>
       </div>
 
-      {/* Start/Stop */}
       <div className="card">
         <div className="row">
           <div className="h2">Start / Stop</div>
@@ -710,7 +636,6 @@ export default function JobPage({ params }: { params: { id: string } }) {
         </div>
       </div>
 
-      {/* Pflicht-Fotos */}
       <div className="card">
         <div className="h2">Fahrzeugausweis / Kilometer (Pflicht)</div>
         <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
@@ -718,7 +643,6 @@ export default function JobPage({ params }: { params: { id: string } }) {
         </div>
 
         <div style={{ marginTop: 12, display: "grid", gap: 12 }}>
-          {/* KM */}
           <div style={{ padding: 12, borderRadius: 16, border: "1px solid rgba(255,255,255,0.08)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
               <div>
@@ -746,7 +670,6 @@ export default function JobPage({ params }: { params: { id: string } }) {
             )}
           </div>
 
-          {/* Ausweis */}
           <div style={{ padding: 12, borderRadius: 16, border: "1px solid rgba(255,255,255,0.08)" }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
               <div>
@@ -787,94 +710,36 @@ export default function JobPage({ params }: { params: { id: string } }) {
         </div>
       </div>
 
-      {/* Rapport */}
       <div className="card">
-        <div className="h2">Rapport</div>
-        <div style={{ marginTop: 8 }}><b>Total:</b> {fmtMin(totals.total)}</div>
+        <div className="h2">Schadenfotos</div>
 
-        {Object.entries(totals.perWorker).map(([w, m]) => (
-          <div key={w}>{w}: {fmtMin(m)}</div>
-        ))}
-
-        <div style={{ marginTop: 12, overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
-            <thead>
-              <tr>
-                <th style={{ textAlign: "left", padding: 8, opacity: 0.7 }}>Mitarbeiter</th>
-                <th style={{ textAlign: "left", padding: 8, opacity: 0.7 }}>Tätigkeit</th>
-                <th style={{ textAlign: "left", padding: 8, opacity: 0.7 }}>Start</th>
-                <th style={{ textAlign: "left", padding: 8, opacity: 0.7 }}>Ende</th>
-              </tr>
-            </thead>
-            <tbody>
-              {entries.map((e) => (
-                <tr key={e.id}>
-                  <td style={{ padding: 8 }}>{e.worker}</td>
-                  <td style={{ padding: 8 }}>{e.task || ""}</td>
-                  <td style={{ padding: 8 }}>{toLocal(e.start_ts)}</td>
-                  <td style={{ padding: 8 }}>{e.end_ts ? toLocal(e.end_ts) : <b>läuft…</b>}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Schaden-Fotos (nur schaden_) */}
-      <div className="card">
-        <div className="row">
-          <div>
-            <div className="h2">Schadenfotos</div>
-            <div className="muted" style={{ fontSize: 12 }}>Löschen ist Chef-geschützt.</div>
-          </div>
-
-          <label className="btn btnPrimary" style={{ cursor: "pointer" }}>
-            Schaden-Foto hinzufügen
-            <input
-              type="file"
-              accept="image/*"
-              capture="environment"
-              style={{ display: "none" }}
-              onChange={async (e) => {
-                const file = e.target.files?.[0];
-                e.target.value = "";
-                if (!file) return;
-                const path = await uploadPhoto(file, "schaden");
-                if (!path) return;
-                await load();
-              }}
-            />
-          </label>
-        </div>
+        <label className="btn btnPrimary" style={{ cursor: "pointer", marginTop: 10 }}>
+          Schaden-Foto hinzufügen
+          <input
+            type="file"
+            accept="image/*"
+            capture="environment"
+            style={{ display: "none" }}
+            onChange={async (e) => {
+              const file = e.target.files?.[0];
+              e.target.value = "";
+              if (!file) return;
+              const path = await uploadPhoto(file, "schaden");
+              if (!path) return;
+              await load();
+            }}
+          />
+        </label>
 
         {damagePhotos.length === 0 ? (
           <div className="muted" style={{ marginTop: 10 }}>Noch keine Schadenfotos.</div>
         ) : (
-          <div
-            style={{
-              marginTop: 12,
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))",
-              gap: 12,
-            }}
-          >
+          <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 12 }}>
             {damagePhotos.map((p) => (
-              <div
-                key={p.path}
-                style={{
-                  borderRadius: 16,
-                  overflow: "hidden",
-                  border: "1px solid rgba(255,255,255,0.08)",
-                }}
-              >
+              <div key={p.path} style={{ borderRadius: 16, overflow: "hidden", border: "1px solid rgba(255,255,255,0.08)" }}>
                 <a href={p.url} target="_blank" rel="noreferrer">
-                  <img
-                    src={p.url}
-                    alt="Schadenfoto"
-                    style={{ width: "100%", height: 130, objectFit: "cover", display: "block" }}
-                  />
+                  <img src={p.url} alt="Schadenfoto" style={{ width: "100%", height: 130, objectFit: "cover", display: "block" }} />
                 </a>
-
                 <div style={{ padding: 8 }}>
                   <div className="muted" style={{ fontSize: 11, wordBreak: "break-all" }}>{p.name}</div>
                   <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
@@ -888,33 +753,23 @@ export default function JobPage({ params }: { params: { id: string } }) {
         )}
       </div>
 
-      {/* Unterschrift */}
       <div className="card">
         <div className="h2">Unterschrift (Chef)</div>
-        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
-          Wird im PDF übernommen, sobald gespeichert.
-        </div>
+        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>Wird im PDF übernommen, sobald gespeichert.</div>
 
         <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <input
-            className="input"
-            value={signName}
-            onChange={(e) => setSignName(e.target.value)}
-            placeholder="Name (optional)"
-            style={{ minWidth: 220 }}
-          />
-          <button
-            className="btn"
-            onClick={() => {
-              const c = canvasRef.current;
-              if (!c) return;
-              const ctx = c.getContext("2d");
-              if (!ctx) return;
-              ctx.clearRect(0, 0, c.width, c.height);
-            }}
-          >
+          <input className="input" value={signName} onChange={(e) => setSignName(e.target.value)} placeholder="Name (optional)" style={{ minWidth: 220 }} />
+
+          <button className="btn" onClick={() => {
+            const c = canvasRef.current;
+            if (!c) return;
+            const ctx = c.getContext("2d");
+            if (!ctx) return;
+            ctx.clearRect(0, 0, c.width, c.height);
+          }}>
             Löschen
           </button>
+
           <button className="btn btnPrimary" onClick={saveSignature} disabled={signBusy}>
             {signBusy ? "Speichert…" : "Unterschrift speichern"}
           </button>
