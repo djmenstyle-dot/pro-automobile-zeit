@@ -1,39 +1,33 @@
 :root {
-  --bg: #07090d;
+  --bg: #0b0c10;
   --card: rgba(255, 255, 255, 0.04);
   --card2: rgba(255, 255, 255, 0.06);
   --border: rgba(255, 255, 255, 0.10);
-  --text: rgba(255, 255, 255, 0.92);
+  --text: #ffffff;
   --muted: rgba(255, 255, 255, 0.65);
   --red: #ff2d2d;
-  --red2: #b41515;
-  --ok: #30d158;
-  --bad: #ff453a;
+  --red2: #d81d1d;
 }
 
 * { box-sizing: border-box; }
-
-html, body {
-  padding: 0;
-  margin: 0;
-  background: radial-gradient(1200px 600px at 0% 0%, rgba(255,45,45,0.25), transparent 50%),
-              radial-gradient(1200px 600px at 100% 0%, rgba(255,45,45,0.18), transparent 55%),
-              var(--bg);
-  color: var(--text);
-  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
-  overflow-x: hidden; /* <<< wichtig: keine Breiten-Explosion */
-}
-
+html, body { padding: 0; margin: 0; background: radial-gradient(1200px 800px at 10% 0%, rgba(255,45,45,0.20), transparent 55%), var(--bg); color: var(--text); }
 a { color: inherit; }
 
-.container {
-  max-width: 1200px;
+.pageWrap {
+  max-width: 1100px;
   margin: 0 auto;
-  padding: 18px;
+  padding: 18px 14px 60px;
+}
+
+.backLink {
+  display: inline-block;
+  margin-bottom: 10px;
+  text-decoration: none;
+  opacity: 0.9;
 }
 
 .card {
-  background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
+  background: linear-gradient(180deg, var(--card2), var(--card));
   border: 1px solid var(--border);
   border-radius: 18px;
   padding: 14px;
@@ -41,56 +35,107 @@ a { color: inherit; }
   overflow: hidden;
 }
 
-.row {
+.rowWrap {
   display: flex;
-  gap: 12px;
   align-items: center;
   justify-content: space-between;
-  flex-wrap: wrap; /* <<< damit nix überlappt */
+  gap: 14px;
+  flex-wrap: wrap;
 }
 
-.h1 { font-size: 22px; font-weight: 800; }
-.h2 { font-size: 16px; font-weight: 800; }
+.titleBlock {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 260px;
+}
+
+.rightPills { display: flex; gap: 10px; align-items: center; }
+
+.logoWrap {
+  width: 56px;
+  height: 56px;
+  border-radius: 16px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.10);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+.logoWrap img { width: 100%; height: 100%; object-fit: contain; }
+
+.h1 { font-size: 22px; font-weight: 800; line-height: 1.15; }
+.h2 { font-size: 16px; font-weight: 800; margin-bottom: 6px; }
+
 .muted { color: var(--muted); }
+.small { font-size: 12px; }
+.break { word-break: break-all; }
+
+.pillRow { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.10);
+  font-size: 12px;
+}
+.dot { width: 8px; height: 8px; border-radius: 99px; display: inline-block; }
+
+.btnRow {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.btnRowTight {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
 
 .btn {
   appearance: none;
-  border: 1px solid var(--border);
-  background: rgba(255,255,255,0.06);
-  color: var(--text);
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(255,255,255,0.05);
+  color: #fff;
   padding: 10px 12px;
-  border-radius: 14px;
-  font-weight: 700;
+  border-radius: 999px;
   cursor: pointer;
-  min-height: 42px;
+  font-weight: 700;
+  line-height: 1;
 }
-
-.btn:hover { background: rgba(255,255,255,0.10); }
+.btn:hover { background: rgba(255,255,255,0.09); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .btnPrimary {
   background: linear-gradient(180deg, var(--red), var(--red2));
-  border: 0;
+  border: 1px solid rgba(255,255,255,0.08);
 }
-
 .btnPrimary:hover { filter: brightness(1.05); }
 
-.btnDanger {
-  background: rgba(255,69,58,0.14);
-  border: 1px solid rgba(255,69,58,0.35);
-}
-
 .btnDark {
-  background: rgba(0,0,0,0.22);
+  background: rgba(255,255,255,0.06);
 }
 
-.input, .select {
+.btnDanger {
+  background: rgba(255, 69, 58, 0.20);
+  border: 1px solid rgba(255, 69, 58, 0.35);
+}
+
+.select, .input {
   width: 100%;
-  border: 1px solid var(--border);
-  background: rgba(0,0,0,0.25);
-  color: var(--text);
   padding: 10px 12px;
   border-radius: 14px;
-  min-height: 42px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(0,0,0,0.25);
+  color: #fff;
   outline: none;
 }
 
@@ -98,44 +143,66 @@ a { color: inherit; }
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
+  margin-top: 10px;
 }
-
-@media (max-width: 900px) {
+@media (max-width: 820px) {
   .grid2 { grid-template-columns: 1fr; }
 }
 
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 10px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: rgba(255,255,255,0.04);
-  font-size: 12px;
-  font-weight: 800;
-}
+.flex1 { flex: 1; min-width: 260px; }
 
-.dot {
-  width: 10px; height: 10px; border-radius: 999px;
-  display: inline-block;
-}
-
-.logoWrap {
-  width: 54px;
-  height: 54px;
+.qr {
+  width: 140px;
+  height: 140px;
   border-radius: 16px;
-  border: 1px solid var(--border);
-  overflow: hidden;
-  background: rgba(255,255,255,0.06);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: #fff;
 }
 
-.logoWrap img {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  padding: 8px;
+.miniList { margin-top: 10px; display: grid; gap: 8px; }
+.miniRow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+
+.tableWrap { margin-top: 12px; overflow-x: auto; }
+.table { width: 100%; border-collapse: collapse; min-width: 640px; }
+.table th, .table td { padding: 10px; border-bottom: 1px solid rgba(255,255,255,0.08); text-align: left; }
+.table th { opacity: 0.75; font-size: 12px; }
+
+.photoGrid {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
 }
+
+.photoCard {
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.03);
+}
+
+.photoImg {
+  width: 100%;
+  height: 140px;
+  object-fit: cover;
+  display: block;
+}
+
+.photoMeta { padding: 10px; }
+
+.sigBox {
+  margin-top: 12px;
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: #ffffff;
+}
+
+.sigCanvas {
+  width: 100%;
+  height: 180px;
+  display: block;
+  background: #ffffff;
+}
+
+.centerY { align-self: center; }
