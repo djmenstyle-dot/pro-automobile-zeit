@@ -34,10 +34,24 @@ export function ensureAdmin(adminPinEnv: string): boolean {
   return true;
 }
 
-/** Für Server-Aktionen (z.B. Löschen via API): wir brauchen den PIN wieder als String */
-export function promptAdminPin(): string | null {
+/**
+ * Pin-Abfrage für "Chef-only" Aktionen (z.B. Foto löschen).
+ * -> passt zu deinem Aufruf: promptAdminPin(adminPin)
+ */
+export function promptAdminPin(adminPinEnv: string): string | null {
+  if (!adminPinEnv) {
+    alert("Admin PIN fehlt (NEXT_PUBLIC_ADMIN_PIN in Vercel setzen).");
+    return null;
+  }
+
   const p = prompt("Chef PIN eingeben:");
   if (!p) return null;
+
+  if (p.trim() !== adminPinEnv.trim()) {
+    alert("PIN falsch");
+    return null;
+  }
+
   return p.trim();
 }
 
